@@ -897,9 +897,18 @@ func get_node_properties(params: Dictionary) -> Dictionary:
 
 	# Optional token-reducing filter: `fields` restricts the response to a
 	# named subset. Defaults off (empty), so existing callers see the full
-	# dump unchanged.
+	# dump unchanged. The MCP tool types this as a list, but batch_execute and
+	# raw callers bypass that, so validate the shape here before iterating.
+	var fields_param: Variant = params.get("fields", [])
+	if fields_param == null:
+		fields_param = []
+	if not (fields_param is Array):
+		return ErrorCodes.make(
+			ErrorCodes.INVALID_PARAMS,
+			"'fields' must be an array of property names, got %s" % type_string(typeof(fields_param)),
+		)
 	var field_filter := {}
-	for f in params.get("fields", []):
+	for f in fields_param:
 		field_filter[str(f)] = true
 	var use_field_filter := not field_filter.is_empty()
 

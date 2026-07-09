@@ -99,9 +99,10 @@ func test_get_properties_has_value_and_type() -> void:
 func test_get_properties_reports_total_count() -> void:
 	var result := _handler.get_node_properties({"path": "/Main/Camera3D"})
 	assert_has_key(result.data, "total_count")
-	## Unfiltered: count equals total_count (every editor-visible prop returned,
-	## minus safe-read skips which also drop from total). count must never exceed
-	## total_count.
+	## total_count counts every editor-visible property; count is what was
+	## returned. Even unfiltered they can differ: a property whose getter
+	## returns null is skipped from the response but still counted in
+	## total_count. So the invariant is count <= total_count, not equality.
 	assert_true(
 		result.data.count <= result.data.total_count,
 		"count must not exceed total_count",
@@ -140,6 +141,16 @@ func test_get_properties_fields_unknown_name_is_skipped() -> void:
 	for prop: Dictionary in result.data.properties:
 		names.append(prop.name)
 	assert_eq(names, ["fov"], "Unknown field names are silently skipped, known ones kept")
+
+
+func test_get_properties_fields_non_array_is_rejected() -> void:
+	## The MCP tool types `fields` as a list, but batch_execute / raw callers
+	## bypass that, so a malformed value must be rejected, not crash the loop.
+	var result := _handler.get_node_properties({
+		"path": "/Main/Camera3D",
+		"fields": "fov",
+	})
+	assert_is_error(result, ErrorCodes.INVALID_PARAMS)
 
 
 func test_get_properties_invalid_path() -> void:
