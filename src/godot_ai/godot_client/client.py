@@ -192,18 +192,31 @@ class GodotClient:
 
         live_session = self.registry.get(session_id)
         pending_new_errors = live_session.pending_new_errors if live_session else 0
-        if surface_error_hints and pending_new_errors > 0:
+        pending_new_warnings = live_session.pending_new_warnings if live_session else 0
+        if surface_error_hints and (pending_new_errors > 0 or pending_new_warnings > 0):
             data = dict(response.data)
-            count = pending_new_errors
-            if live_session:
-                live_session.pending_new_errors = 0
-            data["new_errors_since_last_call"] = count
-            plural = "s" if count != 1 else ""
-            data["new_errors_hint"] = (
-                f"{count} new GDScript error{plural} since your last call. "
-                "Inspect with logs_read(source='editor', include_details=true) "
-                "and/or logs_read(source='game', include_details=true)."
-            )
+            if pending_new_errors > 0:
+                count = pending_new_errors
+                if live_session:
+                    live_session.pending_new_errors = 0
+                data["new_errors_since_last_call"] = count
+                plural = "s" if count != 1 else ""
+                data["new_errors_hint"] = (
+                    f"{count} new GDScript error{plural} since your last call. "
+                    "Inspect with logs_read(source='editor', include_details=true) "
+                    "and/or logs_read(source='game', include_details=true)."
+                )
+            if pending_new_warnings > 0:
+                wcount = pending_new_warnings
+                if live_session:
+                    live_session.pending_new_warnings = 0
+                data["new_warnings_since_last_call"] = wcount
+                wplural = "s" if wcount != 1 else ""
+                data["new_warnings_hint"] = (
+                    f"{wcount} new GDScript warning{wplural} since your last call. "
+                    "Inspect with logs_read(source='editor', include_details=true) "
+                    "and/or logs_read(source='game', include_details=true)."
+                )
             return data
 
         return response.data

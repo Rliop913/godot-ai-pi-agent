@@ -476,6 +476,145 @@ class TestCommandRoundTrip:
         assert third["new_errors_since_last_call"] == 2
         await plugin.close()
 
+    async def test_warning_watermark_advance_injects_warning_hint_once(self, harness):
+        ## A push_warning during a run advances game_warn. It must surface as
+        ## new_warnings_since_last_call — the pre-fix watermark dropped every
+        ## warning, so a warning-only run read as clean.
+        plugin = await harness.connect_plugin(session_id="warn-watermark")
+        client = GodotClient(harness.server, harness.registry)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 1},
+                error_watermark={"run_seq": 1, "editor_ring": 0, "game_warn": 0},
+            )
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 2},
+                error_watermark={"run_seq": 1, "editor_ring": 0, "game_warn": 1},
+            )
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 3},
+                error_watermark={"run_seq": 1, "editor_ring": 0, "game_warn": 1},
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        first = await client.send("get_editor_state")
+        second = await client.send("get_editor_state")
+        third = await client.send("get_editor_state")
+        await handler_task
+
+        assert "new_warnings_since_last_call" not in first
+        assert second["new_warnings_since_last_call"] == 1
+        assert "logs_read(source='editor'" in second["new_warnings_hint"]
+        ## Warnings are not errors — the error hint must stay absent.
+        assert "new_errors_since_last_call" not in second
+        assert "new_warnings_since_last_call" not in third
+        await plugin.close()
+
+    async def test_warning_and_error_watermark_surface_independently(self, harness):
+        ## Errors and warnings advancing in the same response each get their
+        ## own hint and count; neither is folded into the other.
+        plugin = await harness.connect_plugin(session_id="warn-and-err")
+        client = GodotClient(harness.server, harness.registry)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 1},
+                error_watermark={
+                    "run_seq": 1,
+                    "editor_ring": 0,
+                    "editor_ring_warn": 0,
+                },
+            )
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 2},
+                error_watermark={
+                    "run_seq": 1,
+                    "editor_ring": 1,
+                    "editor_ring_warn": 2,
+                },
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        first = await client.send("get_editor_state")
+        second = await client.send("get_editor_state")
+        await handler_task
+
+        assert "new_errors_since_last_call" not in first
+        assert "new_warnings_since_last_call" not in first
+        assert second["new_errors_since_last_call"] == 1
+        assert second["new_warnings_since_last_call"] == 2
+        await plugin.close()
+
+    async def test_warning_watermark_editor_and_game_streams_sum(self, harness):
+        ## Editor-process and game-process warnings are independent streams
+        ## (no shared view like the error path's game/debugger overlap), so
+        ## their deltas sum rather than dedupe with max().
+        plugin = await harness.connect_plugin(session_id="warn-sum")
+        client = GodotClient(harness.server, harness.registry)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 1},
+                error_watermark={"run_seq": 1, "editor_ring_warn": 0, "game_warn": 0},
+            )
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 2},
+                error_watermark={"run_seq": 1, "editor_ring_warn": 1, "game_warn": 2},
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        first = await client.send("get_editor_state")
+        second = await client.send("get_editor_state")
+        await handler_task
+
+        assert "new_warnings_since_last_call" not in first
+        assert second["new_warnings_since_last_call"] == 3
+        await plugin.close()
+
+    async def test_warning_watermark_first_game_warn_on_new_run_counts_full(self, harness):
+        ## game_warn is per-run: first seen on an advanced run has no baseline
+        ## to diff, so it counts in full (mirrors game_error_warn).
+        plugin = await harness.connect_plugin(session_id="warn-new-run")
+        client = GodotClient(harness.server, harness.registry)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 1},
+                error_watermark={"run_seq": 1, "editor_ring": 0},
+            )
+            cmd = await plugin.recv_command()
+            await plugin.send_response(
+                cmd["request_id"],
+                {"ok": 2},
+                error_watermark={"run_seq": 2, "editor_ring": 0, "game_warn": 2},
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        first = await client.send("get_editor_state")
+        second = await client.send("get_editor_state")
+        await handler_task
+
+        assert "new_warnings_since_last_call" not in first
+        assert second["new_warnings_since_last_call"] == 2
+        await plugin.close()
+
     async def test_command_with_params(self, harness):
         plugin = await harness.connect_plugin()
         client = GodotClient(harness.server, harness.registry)

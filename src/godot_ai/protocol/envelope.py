@@ -40,6 +40,8 @@ class CommandResponse(BaseModel):
     ## deltas on Session.pending_new_errors and consumes them only when a
     ## user-facing success response can surface the hint.
     new_errors_since_last_call: int = 0
+    ## Parallel to new_errors_since_last_call for warning-level diagnostics.
+    new_warnings_since_last_call: int = 0
 
 
 class ErrorDetail(BaseModel):

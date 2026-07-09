@@ -790,14 +790,17 @@ func test_game_log_buffer_error_warn_total_ignores_info_and_resets_per_run() -> 
 	buf.append("error", "boom")
 	assert_eq(buf.error_warn_total(), 2)
 	assert_eq(buf.error_total(), 1)
+	assert_eq(buf.warn_total(), 1, "warn_total is the warn-only slice of error_warn_total")
 	buf.clear_for_new_run()
 	assert_eq(buf.error_warn_total(), 0, "new game runs start a fresh error watermark")
 	assert_eq(buf.error_total(), 0, "new game runs start a fresh error-only watermark")
+	assert_eq(buf.warn_total(), 0, "new game runs start a fresh warn watermark")
 	buf.append("info", "chatty print")
 	buf.append("warn", "new run warning")
 	buf.append("error", "new run boom")
 	assert_eq(buf.error_warn_total(), 2)
 	assert_eq(buf.error_total(), 1)
+	assert_eq(buf.warn_total(), 1)
 
 
 func test_game_log_buffer_preserves_details() -> void:
@@ -1240,6 +1243,7 @@ func test_editor_log_buffer_append_and_get_range() -> void:
 	assert_eq(buf.total_count(), 2)
 	assert_eq(buf.appended_total(), 2)
 	assert_eq(buf.error_appended_total(), 1)
+	assert_eq(buf.warn_appended_total(), 1)
 
 
 func test_editor_log_buffer_unknown_level_coerces_to_info() -> void:
@@ -1353,13 +1357,16 @@ func test_editor_log_buffer_clear_resets_retained_counts_but_preserves_cursor() 
 	var buf := McpEditorLogBuffer.new()
 	for i in range(5):
 		buf.append("error", "n %d" % i)
+	buf.append("warn", "a warning")
 	var cursor := buf.appended_total()
+	assert_eq(buf.warn_appended_total(), 1)
 	var cleared := buf.clear()
-	assert_eq(cleared, 5, "clear() should report cleared count")
+	assert_eq(cleared, 6, "clear() should report cleared count")
 	assert_eq(buf.total_count(), 0)
 	assert_eq(buf.dropped_count(), 0)
 	assert_eq(buf.appended_total(), cursor, "clear() must not reset the cursor")
 	assert_eq(buf.error_appended_total(), 0, "clear() resets the retained error watermark")
+	assert_eq(buf.warn_appended_total(), 0, "clear() resets the retained warn watermark")
 
 
 func test_editor_log_buffer_get_since_reports_clear_truncation() -> void:
@@ -1563,7 +1570,7 @@ func test_surfaced_error_tracker_user_clear_then_recurrence_promotes() -> void:
 	tree.free()
 
 
-func test_surfaced_error_tracker_watermark_ignores_warnings() -> void:
+func test_surfaced_error_tracker_watermark_separates_errors_and_warnings() -> void:
 	var editor_buf := McpEditorLogBuffer.new()
 	editor_buf.append("warn", "save warning", "res://warn.gd", 2)
 	editor_buf.append("error", "parse error", "res://broken.gd", 4)
@@ -1574,9 +1581,15 @@ func test_surfaced_error_tracker_watermark_ignores_warnings() -> void:
 	var tree := _make_debugger_errors_tree()
 	var tracker := McpSurfacedErrorTracker.new(editor_buf, game_buf, tree)
 	var watermark := tracker.watermark(true)
+	## Error components count errors only (game_error_warn is a historical
+	## misnomer — it carries errors, not warnings).
 	assert_eq(watermark.editor_ring, 1)
 	assert_eq(watermark.game_error_warn, 1)
 	assert_eq(watermark.debugger_promoted, 1)
+	## Warnings now surface in their own components instead of being dropped —
+	## previously a warning-only run reported as clean.
+	assert_eq(watermark.editor_ring_warn, 1)
+	assert_eq(watermark.game_warn, 1)
 	tree.free()
 
 
