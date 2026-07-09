@@ -2381,6 +2381,28 @@ async def test_node_get_properties_handler():
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
     result = await node_handlers.node_get_properties(runtime, path="/Main/Camera3D")
     assert "properties" in result
+    ## No fields -> params stay minimal so existing callers are unaffected.
+    assert client.calls[-1]["params"] == {"path": "/Main/Camera3D"}
+
+
+async def test_node_get_properties_handler_forwards_fields():
+    client = StubClient()
+    runtime = DirectRuntime(registry=SessionRegistry(), client=client)
+    await node_handlers.node_get_properties(
+        runtime, path="/Main/Camera3D", fields=["fov", "current"]
+    )
+    assert client.calls[-1]["params"] == {
+        "path": "/Main/Camera3D",
+        "fields": ["fov", "current"],
+    }
+
+
+async def test_node_get_properties_handler_empty_fields_omitted():
+    client = StubClient()
+    runtime = DirectRuntime(registry=SessionRegistry(), client=client)
+    await node_handlers.node_get_properties(runtime, path="/Main/Camera3D", fields=[])
+    ## An empty list is not a filter — it must not be forwarded (would filter
+    ## everything out plugin-side otherwise).
     assert client.calls[-1]["params"] == {"path": "/Main/Camera3D"}
 
 

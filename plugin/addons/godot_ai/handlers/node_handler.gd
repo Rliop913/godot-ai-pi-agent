@@ -895,10 +895,22 @@ func get_node_properties(params: Dictionary) -> Dictionary:
 	var node_path: String = resolved.path
 	var scene_root: Node = resolved.scene_root
 
+	# Optional token-reducing filter: `fields` restricts the response to a
+	# named subset. Defaults off (empty), so existing callers see the full
+	# dump unchanged.
+	var field_filter := {}
+	for f in params.get("fields", []):
+		field_filter[str(f)] = true
+	var use_field_filter := not field_filter.is_empty()
+
 	var properties: Array[Dictionary] = []
+	var editor_property_count := 0
 	for prop in node.get_property_list():
 		var usage: int = prop.get("usage", 0)
 		if not (usage & PROPERTY_USAGE_EDITOR):
+			continue
+		editor_property_count += 1
+		if use_field_filter and not field_filter.has(prop.name):
 			continue
 		# Safe read: custom script getters can error; skip bad properties
 		# rather than letting one bad read timeout the entire request.
@@ -916,6 +928,9 @@ func get_node_properties(params: Dictionary) -> Dictionary:
 			"node_type": node.get_class(),
 			"properties": properties,
 			"count": properties.size(),
+			# Total editor-visible properties before field filtering, so a
+			# caller that passed `fields` knows how many were withheld.
+			"total_count": editor_property_count,
 		}
 	}
 

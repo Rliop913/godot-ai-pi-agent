@@ -51,20 +51,32 @@ doesn't match.
 
 def register_node_tools(mcp: FastMCP, *, include_non_core: bool = True) -> None:
     @mcp.tool()
-    async def node_get_properties(ctx: Context, path: str, session_id: str = "") -> dict:
-        """Get all properties of a node.
+    async def node_get_properties(
+        ctx: Context,
+        path: str,
+        fields: list[str] | None = None,
+        session_id: str = "",
+    ) -> dict:
+        """Get properties of a node.
 
         Resource form: ``godot://node/{path}/properties`` — prefer for
-        active-session reads.
+        active-session reads (returns the full property set).
+
+        The default returns every editor-visible property, which can be
+        50-150 entries. Pass ``fields`` to return only the properties you
+        need — a large response-size cut on this hot read. The response
+        always carries ``total_count`` (all editor-visible properties)
+        alongside ``count`` (returned) so you can tell how much was withheld.
 
         Args:
             path: Scene path relative to the edited scene root (e.g.
                 "/Main/Camera3D"), NOT runtime "/root/..." paths. Derive
                 from prior tool responses or scene_get_hierarchy.
+            fields: When non-empty, return only these property names.
             session_id: Optional Godot session to target. Empty = active session.
         """
         runtime = DirectRuntime.from_context(ctx, session_id=session_id or None)
-        return await node_handlers.node_get_properties(runtime, path=path)
+        return await node_handlers.node_get_properties(runtime, path=path, fields=fields)
 
     if not include_non_core:
         return

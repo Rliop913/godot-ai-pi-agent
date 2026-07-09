@@ -96,6 +96,52 @@ func test_get_properties_has_value_and_type() -> void:
 	assert_gt(fov_prop.value, 0, "FOV should be positive")
 
 
+func test_get_properties_reports_total_count() -> void:
+	var result := _handler.get_node_properties({"path": "/Main/Camera3D"})
+	assert_has_key(result.data, "total_count")
+	## Unfiltered: count equals total_count (every editor-visible prop returned,
+	## minus safe-read skips which also drop from total). count must never exceed
+	## total_count.
+	assert_true(
+		result.data.count <= result.data.total_count,
+		"count must not exceed total_count",
+	)
+	assert_gt(result.data.total_count, 0, "Camera3D has editor-visible properties")
+
+
+func test_get_properties_fields_filter_returns_only_requested() -> void:
+	var full := _handler.get_node_properties({"path": "/Main/Camera3D"})
+	var filtered := _handler.get_node_properties({
+		"path": "/Main/Camera3D",
+		"fields": ["fov", "current"],
+	})
+	var names: Array[String] = []
+	for prop: Dictionary in filtered.data.properties:
+		names.append(prop.name)
+	names.sort()
+	assert_eq(names, ["current", "fov"], "Only requested fields returned")
+	assert_eq(filtered.data.count, 2)
+	## total_count is unaffected by the filter — it reflects the full set so a
+	## caller knows how much was withheld.
+	assert_eq(
+		filtered.data.total_count,
+		full.data.total_count,
+		"total_count reflects the full property set regardless of fields",
+	)
+	assert_true(filtered.data.count < full.data.count, "fields cuts the response")
+
+
+func test_get_properties_fields_unknown_name_is_skipped() -> void:
+	var result := _handler.get_node_properties({
+		"path": "/Main/Camera3D",
+		"fields": ["fov", "totally_not_a_real_property"],
+	})
+	var names: Array[String] = []
+	for prop: Dictionary in result.data.properties:
+		names.append(prop.name)
+	assert_eq(names, ["fov"], "Unknown field names are silently skipped, known ones kept")
+
+
 func test_get_properties_invalid_path() -> void:
 	var result := _handler.get_node_properties({"path": "/Main/Nope"})
 	assert_is_error(result, ErrorCodes.NODE_NOT_FOUND)
