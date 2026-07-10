@@ -50,7 +50,7 @@ func test_registry_loads_all_clients() -> void:
 	var ids := McpClientRegistry.ids()
 	assert_gt(ids.size(), 10, "Expected at least 10 registered clients, got %d" % ids.size())
 	# Each existing client must remain registered for behaviour parity.
-	for required in ["claude_code", "claude_desktop", "codex", "antigravity"]:
+	for required in ["claude_code", "claude_desktop", "codex", "antigravity", "zoo_code"]:
 		assert_true(McpClientRegistry.has_id(required), "Missing client: %s" % required)
 
 
@@ -1847,6 +1847,33 @@ func test_kilo_code_verify_flags_pre_fix_typeless_entry_as_drift() -> void:
 	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
 	var legacy_typeless := {"url": "http://x", "disabled": false, "alwaysAllow": []}
 	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "pre-fix typeless entry must register as drift")
+	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "alwaysAllow": []}
+	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
+	var url_drift := {"type": "streamable-http", "url": "http://other", "disabled": false, "alwaysAllow": []}
+	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
+
+
+func test_zoo_code_pins_streamable_http_transport() -> void:
+	## Zoo Code uses the Roo-family `mcp_settings.json` / `mcpServers` shape.
+	## Pin `type: streamable-http` so a fresh entry negotiates against our
+	## streamable-http endpoint without relying on upstream defaults.
+	var c := McpClientRegistry.get_by_id("zoo_code")
+	var entry := McpJsonStrategy.build_entry(c, "http://x")
+	assert_eq(entry.get("type", ""), "streamable-http")
+	assert_eq(entry.get("url", ""), "http://x")
+	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/zoo.json")
+	assert_contains(manual, "\"type\": \"streamable-http\"")
+
+
+func test_zoo_code_verify_flags_typeless_entry_as_drift() -> void:
+	## Local extension inspection confirmed Zoo stores MCP settings in the same
+	## `mcp_settings.json` shape as Roo. A typeless legacy entry must therefore
+	## register as drift so Configure rewrites it with the transport pin.
+	var c := McpClientRegistry.get_by_id("zoo_code")
+	var current := McpJsonStrategy.build_entry(c, "http://x")
+	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
+	var legacy_typeless := {"url": "http://x", "disabled": false, "alwaysAllow": []}
+	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "typeless Zoo entry must register as drift")
 	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "alwaysAllow": []}
 	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
 	var url_drift := {"type": "streamable-http", "url": "http://other", "disabled": false, "alwaysAllow": []}
