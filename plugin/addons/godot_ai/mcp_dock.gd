@@ -951,7 +951,12 @@ func _update_status() -> void:
 		status_text = "Incompatible server on port %d" % ClientConfigurator.http_port()
 		status_color = Color.RED
 	elif state == ServerStateScript.FOREIGN_PORT:
-		status_text = "Port %d held by another process" % ClientConfigurator.http_port()
+		## #647: the post-crash probe names the actual conflicting port
+		## (HTTP or WS) — don't blame port 8000 when 9500 is the occupant.
+		var conflict_port: int = int(server_status.get("conflict_port", 0))
+		if conflict_port <= 0:
+			conflict_port = ClientConfigurator.http_port()
+		status_text = "Port %d held by another process" % conflict_port
 		status_color = Color.RED
 	elif state == ServerStateScript.NO_COMMAND:
 		status_text = "No server command found"
@@ -1021,9 +1026,14 @@ func _update_crash_panel(server_status: Dictionary) -> void:
 			and not bool(server_status.get("can_recover_incompatible", false))
 		)
 
+	## #647: the quick picker only moves `godot_ai/http_port`, so hide it
+	## when the diagnosed conflict is on the WebSocket port — the crash
+	## body already points at `godot_ai/ws_port` in Editor Settings.
+	var conflict_port := int(server_status.get("conflict_port", 0))
+	var http_conflict := conflict_port <= 0 or conflict_port == ClientConfigurator.http_port()
 	var port_picker_visible := (
 		state == ServerStateScript.PORT_EXCLUDED
-		or state == ServerStateScript.FOREIGN_PORT
+		or (state == ServerStateScript.FOREIGN_PORT and http_conflict)
 	)
 	_port_picker_panel.visible = port_picker_visible
 	if port_picker_visible:
@@ -1060,6 +1070,12 @@ static func _crash_body_for_state(state: int, server_status: Dictionary = {}) ->
 				return "%s %s" % [message, hint]
 			return "Port %d is occupied by an incompatible server. %s" % [port, hint]
 		ServerStateScript.FOREIGN_PORT:
+			## #647: prefer the lifecycle's diagnosis (it names the right
+			## port — HTTP vs WS — and the Editor Setting to change) over
+			## the generic HTTP-port fallback.
+			var foreign_message := str(server_status.get("message", ""))
+			if not foreign_message.is_empty():
+				return foreign_message
 			return "Another process is already bound to port %d. Pick a free port or stop the other process." % port
 		ServerStateScript.CRASHED:
 			## Both spawn attempts failed on the uvx tier — almost always
