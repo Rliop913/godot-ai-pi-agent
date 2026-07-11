@@ -1597,6 +1597,96 @@ func test_atomic_write_preserves_existing_file_when_swap_fails() -> void:
 	DirAccess.remove_absolute(backup_path)
 
 
+# ----- atomic write: concurrency + symlink targets (#534) -----
+
+## List leftover files in _scratch_dir whose name starts with `prefix` — used
+## to prove no temp staging file (fixed or PID-suffixed) lingers after a write.
+func _leftover_tmp_files(prefix: String) -> Array[String]:
+	var out: Array[String] = []
+	for f in DirAccess.get_files_at(_scratch_dir):
+		if f.begins_with(prefix):
+			out.append(f)
+	return out
+
+
+func test_atomic_write_leaves_no_stale_tmp_of_any_name() -> void:
+	## #534: the temp name is now PID-suffixed. Whatever the exact name, no
+	## staging file starting with "<file>.tmp" may survive a successful write.
+	var path := _scratch_dir.path_join("pid_tmp.txt")
+	assert_true(McpAtomicWrite.write(path, "hello"))
+	var leftovers := _leftover_tmp_files("pid_tmp.txt.tmp")
+	assert_eq(leftovers.size(), 0, "no .tmp staging file may linger: %s" % str(leftovers))
+
+
+func test_atomic_write_leaves_no_stale_tmp_after_failed_write() -> void:
+	## #534 review follow-up: the PID-suffixed staging file must also be
+	## cleaned up when the write FAILS (destination is a directory, so the
+	## rename and the copy fallback both reject) — otherwise a regression
+	## could accumulate ".tmp.<pid>" files invisibly.
+	var dir_dest := _scratch_dir.path_join("tmp_fail_dir.txt")
+	DirAccess.make_dir_recursive_absolute(dir_dest)
+	assert_false(
+		McpAtomicWrite.write(dir_dest, "content"),
+		"writing over a directory must fail",
+	)
+	var leftovers := _leftover_tmp_files("tmp_fail_dir.txt.tmp")
+	assert_eq(leftovers.size(), 0, "no .tmp staging file may linger after a failed write: %s" % str(leftovers))
+
+
+func test_atomic_write_does_not_use_fixed_tmp_name() -> void:
+	## #534: two editors clicking Configure at once must not interleave bytes
+	## on a shared "<path>.tmp". Prove the fixed name is no longer the staging
+	## path by parking an unwritable obstacle (a directory) at it — the write
+	## must still succeed because it stages elsewhere (PID-suffixed).
+	var path := _scratch_dir.path_join("no_fixed_tmp.txt")
+	var fixed_tmp := path + ".tmp"
+	DirAccess.make_dir_recursive_absolute(fixed_tmp)
+
+	assert_true(
+		McpAtomicWrite.write(path, "content"),
+		"write must succeed even when '<path>.tmp' is occupied — the staging name must be process-unique",
+	)
+	var rf := FileAccess.open(path, FileAccess.READ)
+	var got := rf.get_as_text()
+	rf.close()
+	assert_eq(got, "content")
+	# Cleanup — the obstacle dir is outside suite_teardown's flat-file sweep.
+	DirAccess.remove_absolute(fixed_tmp)
+
+
+func test_atomic_write_preserves_symlinked_target() -> void:
+	## #534: stow/chezmoi users symlink their configs. A rename over the link
+	## path would replace the LINK with a regular file, detaching the config
+	## from the dotfile repo. The write must land through the link into the
+	## real target, leaving the symlink intact.
+	if OS.get_name() == "Windows":
+		skip("creating POSIX symlinks is not portable on Windows")
+		return
+	var target := _scratch_dir.path_join("symlink_real_target.json")
+	var link := _scratch_dir.path_join("symlink_config.json")
+	var tf := FileAccess.open(target, FileAccess.WRITE)
+	tf.store_string("old")
+	tf.close()
+	DirAccess.remove_absolute(link)
+	# Godot has no symlink-create API; shell out. Skip if ln isn't usable.
+	var rc := OS.execute("ln", ["-s", target, link])
+	var da := DirAccess.open(_scratch_dir)
+	if rc != 0 or da == null or not da.is_link(link):
+		skip("could not create a symlink on this platform")
+		return
+
+	assert_true(McpAtomicWrite.write(link, "new via link"))
+
+	assert_true(da.is_link(link), "the symlink must survive the atomic write — issue #534")
+	var rf := FileAccess.open(target, FileAccess.READ)
+	var got := rf.get_as_text()
+	rf.close()
+	assert_eq(got, "new via link", "the new bytes must land in the symlink's real target")
+	# Cleanup (the .backup lands next to the resolved target).
+	DirAccess.remove_absolute(target + ".backup")
+	DirAccess.remove_absolute(link)
+
+
 # ----- atomic write: permission preservation (#297 finding TC-1) -----
 #
 # The Claude CLI creates ~/.claude.json as 0600 (it holds OAuth creds). A
