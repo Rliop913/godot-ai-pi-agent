@@ -91,6 +91,87 @@ class TestTelemetryToolSync:
         assert rec.data["error"] == "RESOURCE_NOT_FOUND"
         assert "secret-project" not in rec.data["error"]
         assert "candidate" not in rec.data["error"]
+        ## No sub_code in data → no error_sub_code field at all.
+        assert "error_sub_code" not in rec.data
+
+    def test_records_editor_not_ready_sub_code(self, isolated_collector) -> None:
+        """#651 stage 1: EDITOR_NOT_READY carries data.sub_code naming the
+        blocking editor state; telemetry records it as a SEPARATE
+        error_sub_code field so dashboards keying on the exact
+        EDITOR_NOT_READY string keep working."""
+        _, sent = isolated_collector
+
+        @tel.telemetry_tool("script_patch")
+        def my_tool() -> None:
+            raise GodotCommandError(
+                code="EDITOR_NOT_READY",
+                message="Editor is importing resources — try again shortly",
+                data={"sub_code": "EDITOR_IMPORTING", "retryable": True},
+            )
+
+        with pytest.raises(GodotCommandError):
+            my_tool()
+        _wait_for(sent, 1)
+
+        rec = sent[0]
+        assert rec.data["error"] == "EDITOR_NOT_READY"
+        assert rec.data["error_sub_code"] == "EDITOR_IMPORTING"
+
+    def test_sub_code_extraction_tolerates_non_dict_data(self) -> None:
+        """_safe_error_sub_code duck-types on the class NAME (mirroring
+        _safe_exception_category), so a foreign GodotCommandError whose
+        ``data`` isn't a dict must be handled, not assumed normalized."""
+
+        class GodotCommandError(Exception):  # noqa: N818 — deliberate name collision
+            code = "EDITOR_NOT_READY"
+            data = None
+
+        assert tel._safe_error_sub_code(GodotCommandError()) is None
+
+    def test_sub_code_ignored_on_other_error_codes(self, isolated_collector) -> None:
+        """A non-EDITOR_NOT_READY error carrying a stray data.sub_code
+        (plugin bug / copy-paste) must not mis-attribute its telemetry row —
+        sub-codes are the EDITOR_NOT_READY family's vocabulary only."""
+        _, sent = isolated_collector
+
+        @tel.telemetry_tool("my_tool")
+        def my_tool() -> None:
+            raise GodotCommandError(
+                code="NODE_NOT_FOUND",
+                message="Node not found: /Main/Missing",
+                data={"sub_code": "EDITOR_PLAYING"},
+            )
+
+        with pytest.raises(GodotCommandError):
+            my_tool()
+        _wait_for(sent, 1)
+
+        rec = sent[0]
+        assert rec.data["error"] == "NODE_NOT_FOUND"
+        assert "error_sub_code" not in rec.data
+
+    def test_unknown_sub_code_is_not_recorded(self, isolated_collector) -> None:
+        """data is plugin-provided — only allowlisted EditorNotReadySubCode
+        values may reach telemetry, so a hijacked/typo'd sub_code (or one
+        added GDScript-side without the Python enum sync) is dropped."""
+        _, sent = isolated_collector
+
+        @tel.telemetry_tool("my_tool")
+        def my_tool() -> None:
+            raise GodotCommandError(
+                code="EDITOR_NOT_READY",
+                message="nope",
+                data={"sub_code": "res://secret-project/scene.tscn"},
+            )
+
+        with pytest.raises(GodotCommandError):
+            my_tool()
+        _wait_for(sent, 1)
+
+        rec = sent[0]
+        assert rec.data["error"] == "EDITOR_NOT_READY"
+        assert "error_sub_code" not in rec.data
+        assert "secret-project" not in str(rec.data)
 
     def test_replaces_unknown_godot_command_error_code(self, isolated_collector) -> None:
         _, sent = isolated_collector
@@ -181,6 +262,26 @@ class TestTelemetryToolAsync:
         assert sent[0].data["success"] is False
         assert sent[0].data["error"] == "RuntimeError"
         assert "async boom" not in sent[0].data["error"]
+
+    def test_async_records_editor_not_ready_sub_code(self, isolated_collector) -> None:
+        """Handlers are async in production — the async wrapper must thread
+        the sub-code the same way the sync one does."""
+        _, sent = isolated_collector
+
+        @tel.telemetry_tool("async_tool")
+        async def my_async() -> None:
+            raise GodotCommandError(
+                code="EDITOR_NOT_READY",
+                message="Editor is in play mode",
+                data={"sub_code": "EDITOR_PLAYING", "retryable": False},
+            )
+
+        with pytest.raises(GodotCommandError):
+            asyncio.run(my_async())
+        _wait_for(sent, 1)
+
+        assert sent[0].data["error"] == "EDITOR_NOT_READY"
+        assert sent[0].data["error_sub_code"] == "EDITOR_PLAYING"
 
 
 class TestTelemetryResource:
