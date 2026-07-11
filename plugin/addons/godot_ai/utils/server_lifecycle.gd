@@ -410,6 +410,19 @@ func _set_owner_pid_env() -> bool:
 	return true
 
 
+## Mark the next OS.create_process as plugin-spawned so the server arms its
+## session-idle self-terminate backstop (#498): with zero editor sessions for
+## a grace window, it exits on its own. Unlike the owner-PID reaper this is
+## pure session-count on the server side, so it is set on EVERY platform —
+## including Windows, where owner-PID is skipped; this marker is what finally
+## gives Windows orphan coverage (#497). Same env-channel rationale and same
+## tight scoping as _set_owner_pid_env: callers unset it right after spawning
+## so a later manually-started dev server can never inherit it and idle-kill
+## itself.
+func _set_plugin_spawned_env() -> void:
+	OS.set_environment("GODOT_AI_PLUGIN_SPAWNED", "1")
+
+
 ## Branch table (recorded version is the "is this ours?" signal — uvx
 ## launcher PIDs go stale; #135/#137):
 ##   port free                                -> spawn fresh, record PID
@@ -557,12 +570,14 @@ func start_server() -> void:
 	## process-liveness/self-shutdown isn't live-validated yet). The server
 	## gates on this too.
 	var owner_env_set := _set_owner_pid_env()
+	_set_plugin_spawned_env()
 
 	_server_pid = OS.create_process(cmd, args)
 	var spawned_pid := int(_server_pid)
 
 	if owner_env_set:
 		OS.unset_environment("GODOT_AI_OWNER_PID")
+	OS.unset_environment("GODOT_AI_PLUGIN_SPAWNED")
 
 	## Restore PYTHONPATH immediately — the spawned child has already
 	## copied the env, so the editor's own process state returns to
@@ -648,9 +663,11 @@ func respawn_with_refresh() -> void:
 	## Set owner PID for THIS spawn too (don't rely on it lingering from
 	## start_server) — and unset right after, same scoping as start_server.
 	var owner_env_set := _set_owner_pid_env()
+	_set_plugin_spawned_env()
 	_server_pid = OS.create_process(cmd, args)
 	if owner_env_set:
 		OS.unset_environment("GODOT_AI_OWNER_PID")
+	OS.unset_environment("GODOT_AI_PLUGIN_SPAWNED")
 	if injected_telemetry_env:
 		OS.unset_environment("GODOT_AI_DISABLE_TELEMETRY")
 	var spawn_pid := int(_server_pid)
