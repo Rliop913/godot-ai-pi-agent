@@ -733,6 +733,120 @@ func test_path_template_xdg_fallback() -> void:
 	assert_true(resolved.ends_with("/foo"))
 
 
+# ----- config-home env override (#617) -----
+
+const TEST_CFG_HOME_ENV := "GODOT_AI_TEST_CFG_HOME"
+
+
+func _make_env_override_toml_client(default_path: String) -> McpClient:
+	var c := _make_test_toml_client(default_path)
+	c.config_home_env = TEST_CFG_HOME_ENV
+	c.config_home_env_subpath = "config.toml"
+	return c
+
+
+func test_config_home_env_overrides_path_template() -> void:
+	var default_path := _scratch_dir.path_join("env_default/config.toml")
+	var client := _make_env_override_toml_client(default_path)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	var env_home := _scratch_dir.path_join("env_home")
+	OS.set_environment(TEST_CFG_HOME_ENV, env_home)
+	var resolved := client.resolved_config_path()
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+	assert_eq(resolved, env_home.path_join("config.toml"), "env var should override path_template")
+
+
+func test_config_home_env_unset_falls_back_to_path_template() -> void:
+	var default_path := _scratch_dir.path_join("env_default/config.toml")
+	var client := _make_env_override_toml_client(default_path)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.unset_environment(TEST_CFG_HOME_ENV)
+	var resolved_unset := client.resolved_config_path()
+	# Empty / whitespace-only value must also fall back — an exported-but-blank
+	# var means "not relocated".
+	OS.set_environment(TEST_CFG_HOME_ENV, "   ")
+	var resolved_blank := client.resolved_config_path()
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+	assert_eq(resolved_unset, default_path, "unset env var should fall back to path_template")
+	assert_eq(resolved_blank, default_path, "blank env var should fall back to path_template")
+
+
+func test_config_home_override_requires_both_fields() -> void:
+	var default_path := _scratch_dir.path_join("env_default/config.toml")
+	var client := _make_test_toml_client(default_path)
+	client.config_home_env = TEST_CFG_HOME_ENV
+	# subpath left empty → no override even when the env var is set.
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.set_environment(TEST_CFG_HOME_ENV, _scratch_dir.path_join("env_home"))
+	var resolved := client.resolved_config_path()
+	var override := client.config_home_override()
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+	assert_eq(override, "", "missing subpath must disable the override")
+	assert_eq(resolved, default_path, "missing subpath must fall back to path_template")
+
+
+func test_config_home_env_configure_and_drift_use_override() -> void:
+	## End-to-end: with the env var set, Configure writes to the env-var
+	## location, drift detection reads it back from there, and Remove cleans
+	## it up — the path_template default is never touched.
+	var default_path := _scratch_dir.path_join("env_default_untouched.toml")
+	_remove_if_exists(default_path)
+	var client := _make_env_override_toml_client(default_path)
+	var env_home := _scratch_dir.path_join("env_home_e2e")
+	DirAccess.make_dir_recursive_absolute(env_home)
+	var env_path := env_home.path_join("config.toml")
+	_remove_if_exists(env_path)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.set_environment(TEST_CFG_HOME_ENV, env_home)
+
+	var result := McpTomlStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var wrote_env := FileAccess.file_exists(env_path)
+	var wrote_default := FileAccess.file_exists(default_path)
+	var status := McpTomlStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var drift := McpTomlStrategy.check_status(client, "godot-ai", "http://127.0.0.1:9000/mcp")
+	var installed := client.is_installed()
+	var removed := McpTomlStrategy.remove(client, "godot-ai")
+	var post_remove := McpTomlStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+	_remove_if_exists(env_path)
+
+	assert_eq(result.get("status"), "ok")
+	assert_true(wrote_env, "Configure must write the env-var location")
+	assert_false(wrote_default, "Configure must not touch the path_template default")
+	assert_eq(status, McpClient.Status.CONFIGURED)
+	assert_eq(drift, McpClient.Status.CONFIGURED_MISMATCH, "URL drift must be detected at the overridden path")
+	assert_true(installed, "config existing at the env-var location must count as installed")
+	assert_eq(removed.get("status"), "ok")
+	assert_eq(post_remove, McpClient.Status.NOT_CONFIGURED)
+
+
+func test_codex_declares_codex_home_override() -> void:
+	var client := McpClientRegistry.get_by_id("codex")
+	assert_true(client != null, "codex must be registered")
+	assert_eq(client.config_home_env, "CODEX_HOME")
+	assert_eq(client.config_home_env_subpath, "config.toml", "config.toml lives directly in $CODEX_HOME")
+
+
+func test_claude_code_declares_claude_config_dir_override() -> void:
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	assert_eq(client.config_home_env, "CLAUDE_CONFIG_DIR")
+	assert_eq(client.config_home_env_subpath, ".claude.json")
+
+
 # ----- JSON strategy round-trip -----
 
 func test_json_strategy_round_trip() -> void:
