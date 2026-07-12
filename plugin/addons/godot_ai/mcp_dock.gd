@@ -2456,6 +2456,20 @@ func _show_manual_command_for(client_id: String) -> void:
 		return
 	row["manual_text"].text = cmd
 	row["manual_panel"].visible = true
+	## #680: for rows low in the list the panel materializes below the
+	## visible scroll area and the Configure click looks like a no-op.
+	## Deferred so the just-shown panel has a settled rect to scroll to.
+	_scroll_manual_panel_into_view.call_deferred(row["manual_panel"])
+
+
+func _scroll_manual_panel_into_view(panel: Control) -> void:
+	if panel == null or not panel.is_inside_tree():
+		return
+	var ancestor := panel.get_parent()
+	while ancestor != null and not (ancestor is ScrollContainer):
+		ancestor = ancestor.get_parent()
+	if ancestor != null:
+		(ancestor as ScrollContainer).ensure_control_visible(panel)
 
 
 func _on_copy_manual_command(client_id: String) -> void:
