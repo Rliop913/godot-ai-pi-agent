@@ -170,6 +170,9 @@ var _startup_trace_enabled := false
 var _startup_trace_start_ms := 0
 var _startup_trace_last_ms := 0
 var _startup_trace_counters: Dictionary = {}
+## Startup-path probes can now run on a worker thread (#678); the trace
+## counters they bump are shared with the main thread, so serialize.
+var _startup_trace_mutex := Mutex.new()
 var _startup_trace_netsh_start_count := 0
 
 
@@ -206,6 +209,12 @@ func _enter_tree() -> void:
 	## buffer. Without this the choice only took effect after a manual toggle
 	## and reset to noisy on every editor restart (#626).
 	_log_buffer.enabled = McpSettings.mcp_logging_enabled()
+	## #678: in the real editor, run the startup path's blocking probes and
+	## kill-drain waits off the main thread so a contended port can't freeze
+	## plugin init/reload. Set here (not _init) so test fixtures — which
+	## extend this plugin but never enter the tree — keep the synchronous
+	## default and can call-then-assert.
+	_lifecycle.defer_blocking_work = true
 	_start_server()
 	_startup_trace_phase("server_start")
 
@@ -420,8 +429,8 @@ func _enter_tree() -> void:
 		_telemetry.record_dock_startup()
 		_flush_pending_self_update_telemetry()
 		_telemetry.flush_pending_plugin_reload()
-	var startup_path: String = str(_lifecycle.get_startup_path())
-	_startup_trace_finish(startup_path if not startup_path.is_empty() else "loaded")
+	## The startup-trace 'done' line is stamped by _start_server after the
+	## (possibly suspended) walk completes — not here (#682 review).
 
 
 ## Public wrapper around the dev-server-toggle telemetry emit. Lets the
@@ -664,7 +673,9 @@ func _startup_trace_begin() -> void:
 func _startup_trace_count(counter: String, amount: int = 1) -> void:
 	if not _startup_trace_enabled:
 		return
+	_startup_trace_mutex.lock()
 	_startup_trace_counters[counter] = int(_startup_trace_counters.get(counter, 0)) + amount
+	_startup_trace_mutex.unlock()
 
 
 func _startup_trace_phase(name: String) -> void:
@@ -682,17 +693,28 @@ func _startup_trace_finish(path: String) -> void:
 	if not _startup_trace_enabled:
 		return
 	var now := Time.get_ticks_msec()
+	## Same lock as _startup_trace_count — a worker probe may still be
+	## bumping counters while this reads/writes the shared dictionary.
+	_startup_trace_mutex.lock()
 	_startup_trace_counters["netsh"] = (
 		WindowsPortReservation.netsh_query_count() - _startup_trace_netsh_start_count
 	)
+	var counters_snapshot: Dictionary = _startup_trace_counters.duplicate()
+	_startup_trace_mutex.unlock()
 	print(
 		"MCP startup trace | done path=%s total_ms=%d counters=%s"
-		% [path, now - _startup_trace_start_ms, str(_startup_trace_counters)]
+		% [path, now - _startup_trace_start_ms, str(counters_snapshot)]
 	)
 
 
 func _start_server() -> void:
-	_lifecycle.start_server()
+	await _lifecycle.start_server()
+	## The walk may have suspended (#678), so this line — not _enter_tree's
+	## tail — is where the real startup outcome is known. Stamp the trace
+	## 'done' here so the contended-port path and duration stay honest
+	## instead of reporting a placeholder before the walk finished.
+	var startup_path: String = str(_lifecycle.get_startup_path())
+	_startup_trace_finish(startup_path if not startup_path.is_empty() else "loaded")
 
 
 ## Test-fixture shim — characterization tests in test_plugin_lifecycle
@@ -1107,13 +1129,20 @@ func _find_managed_pid(port: int) -> int:
 ## preserves the historical behavior for callers outside the spawn flow
 ## (`can_recover_incompatible_server`, the dock's UI buttons), where a
 ## fresh probe is the right thing.
-func _evaluate_strong_port_occupant_proof(port: int, live: Dictionary = {}) -> Dictionary:
+## `record_override`: a managed-server record snapshot the caller already
+## read. Non-empty skips the internal `_read_managed_server_record()` —
+## required when this helper runs on a worker thread (#678), because the
+## record lives in EditorSettings, which is main-thread-only. `{}` keeps
+## the historical read-it-here behavior for synchronous callers
+## (`_read_managed_server_record` never returns a bare `{}`, so the
+## sentinel is unambiguous).
+func _evaluate_strong_port_occupant_proof(port: int, live: Dictionary = {}, record_override: Dictionary = {}) -> Dictionary:
 	var result := {"proof": "", "pids": []}
 	var listener_pids := _find_all_pids_on_port(port)
 	if listener_pids.is_empty():
 		return result
 
-	var record := _read_managed_server_record()
+	var record: Dictionary = record_override if not record_override.is_empty() else _read_managed_server_record()
 	var record_pid := int(record.get("pid", 0))
 	var record_version := str(record.get("version", ""))
 
@@ -1162,7 +1191,10 @@ func _evaluate_recovery_port_occupant_proof(port: int, live: Dictionary = {}) ->
 
 
 func _recover_strong_port_occupant(port: int, wait_s: float, pre_kill_live: Dictionary = {}) -> bool:
-	return _lifecycle.recover_strong_port_occupant(port, wait_s, pre_kill_live)
+	## `await` because the manager method is a coroutine in production
+	## (#678); with `defer_blocking_work` off it completes synchronously
+	## and this await is a pass-through.
+	return await _lifecycle.recover_strong_port_occupant(port, wait_s, pre_kill_live)
 
 
 func _legacy_pidfile_kill_targets(_port: int, listener_pids: Array[int]) -> Array[int]:
@@ -1547,7 +1579,11 @@ func _resume_connection_after_recovery() -> void:
 
 
 func recover_incompatible_server() -> bool:
-	if not _lifecycle.recover_incompatible_server():
+	## `await` because the manager's recovery is a coroutine in production
+	## (#678): `_resume_connection_after_recovery` gates on the post-walk
+	## state, so it must not run until the respawn walk has completed. With
+	## `defer_blocking_work` off this completes synchronously.
+	if not await _lifecycle.recover_incompatible_server():
 		return false
 	_resume_connection_after_recovery()
 	return true

@@ -205,7 +205,44 @@ func test_parse_sha256_digest_matches_fileaccess_hash() -> void:
 		"parsed sidecar digest must match FileAccess.get_sha256 (the verify compare)")
 
 
-# ---- _verify_then_install URL scoping (#599) ---------------------------
+# ---- _verify_then_install mandatory verification (#599) ----------------
+
+func test_verify_refuses_missing_checksum_sidecar() -> void:
+	## Verification is mandatory: a release published without a `.sha256`
+	## sidecar (mistake or tamper) must refuse to install — the old
+	## verify-if-present bypass silently downgraded to an unverified install.
+	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
+	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
+	DirAccess.make_dir_recursive_absolute(global_dir)
+	var f := FileAccess.open(global_zip, FileAccess.WRITE)
+	assert_true(f != null, "Seed staged zip must open for write")
+	f.store_string("staged update payload")
+	f.close()
+
+	var manager = McpUpdateManagerScript.new()
+	manager._latest_checksum_url = ""
+	var states: Array[Dictionary] = []
+	manager.install_state_changed.connect(func(state: Dictionary) -> void:
+		states.append(state)
+	)
+
+	manager._verify_then_install()
+
+	var zip_still_staged := FileAccess.file_exists(global_zip)
+	manager.free()
+	DirAccess.remove_absolute(global_zip)
+	DirAccess.remove_absolute(global_dir)
+
+	assert_false(zip_still_staged,
+		"a missing checksum sidecar must drop the staged ZIP, not install it")
+	assert_eq(states.size(), 1,
+		"a missing checksum sidecar must emit exactly one failure state")
+	var state: Dictionary = states[0]
+	assert_contains(String(state.get("button_text", "")), "Verification failed",
+		"a missing checksum sidecar must paint the verification-failed button")
+	assert_eq(bool(state.get("button_disabled", true)), false,
+		"a missing checksum sidecar must leave the button enabled for retry")
+
 
 func test_verify_refuses_wrong_repo_checksum_url() -> void:
 	## A checksum sidecar URL on a trusted GitHub host but pointing at a
@@ -225,7 +262,7 @@ func test_verify_refuses_wrong_repo_checksum_url() -> void:
 		"https://github.com/evil-org/godot-ai/releases/download/v999.0.0/"
 		+ "godot-ai-plugin.zip.sha256"
 	)
-	var states: Array = []
+	var states: Array[Dictionary] = []
 	manager.install_state_changed.connect(func(state: Dictionary) -> void:
 		states.append(state)
 	)
@@ -268,7 +305,7 @@ func test_checksum_match_on_repo_release_proceeds_to_install() -> void:
 	assert_true(
 		McpUpdateManagerScript._is_trusted_download_url(manager._latest_checksum_url),
 		"Seed: the repo-scoped sidecar URL must pass the trust guard")
-	var states: Array = []
+	var states: Array[Dictionary] = []
 	manager.install_state_changed.connect(func(state: Dictionary) -> void:
 		states.append(state)
 	)
@@ -387,8 +424,8 @@ func test_parse_releases_response_captures_checksum_asset_url() -> void:
 
 
 func test_parse_releases_response_checksum_empty_when_absent() -> void:
-	## Older releases without a sidecar must leave checksum_url empty so the
-	## installer takes the verify-if-present (skip) path rather than failing.
+	## A release without a sidecar must leave checksum_url empty — that's the
+	## signal `_verify_then_install` uses to REFUSE the install (#599).
 	var body := _make_body(_make_release_payload("v999.0.0"))
 	var result := McpUpdateManagerScript.parse_releases_response(
 		HTTPRequest.RESULT_SUCCESS, 200, body
@@ -503,8 +540,8 @@ func test_update_check_below_floor_does_not_arm_download() -> void:
 	## update offer. Otherwise one click can install the 4.5+-only release.
 	var manager = _NoSelfUpdateManager.new()
 	var body := _make_body(_make_release_payload("v999.0.0"))
-	var states: Array = []
-	var update_results: Array = []
+	var states: Array[Dictionary] = []
+	var update_results: Array[Dictionary] = []
 	manager.install_state_changed.connect(func(state: Dictionary) -> void:
 		states.append(state)
 	)
@@ -538,7 +575,7 @@ func test_start_install_below_floor_only_repaints_guidance() -> void:
 	## If a stale UI path calls start_install anyway, keep it inside the
 	## guidance state rather than opening the browser or entering install.
 	var manager = _NoSelfUpdateManager.new()
-	var states: Array = []
+	var states: Array[Dictionary] = []
 	manager.install_state_changed.connect(func(state: Dictionary) -> void:
 		states.append(state)
 	)
