@@ -156,7 +156,7 @@ static func _extract_block(text: String) -> Dictionary:
 	# mis-nests 2-space-indented siblings under the first entry.
 	var entry_indent := -1
 	var probe := header_idx + 1
-	while probe < lines.size() and lines[probe].strip_edges().is_empty():
+	while probe < lines.size() and _is_blank_or_comment(lines[probe]):
 		probe += 1
 	if probe < lines.size():
 		entry_indent = _indent_of(lines[probe])
@@ -174,7 +174,12 @@ static func _extract_block(text: String) -> Dictionary:
 	var i := header_idx + 1
 	while i < lines.size():
 		var raw := lines[i]
-		if raw.strip_edges().is_empty():
+		## Comment-only lines inside the block are skipped like blanks —
+		## treating one as an entry header would re-emit it as a bogus
+		## `# comment:` server on rewrite. (Comments INSIDE the rewritten
+		## block are consequently dropped; comments outside the block live
+		## in prefix/suffix and survive verbatim.)
+		if _is_blank_or_comment(raw):
 			i += 1
 			continue
 		# Stop at any line indented less than a sibling entry (parent key
@@ -200,7 +205,9 @@ static func _parse_entry(raw: String, lines: PackedStringArray, start: int, entr
 	var i := start + 1
 	while i < lines.size():
 		var l := lines[i]
-		if l.strip_edges().is_empty():
+		## Comments inside an entry (e.g. `    # auth for CI`) would parse
+		## as a `# auth for CI` key — skip them like blanks.
+		if _is_blank_or_comment(l):
 			i += 1
 			continue
 		# A line at or above the entry's indent is a sibling/parent key.
@@ -233,7 +240,7 @@ static func _parse_subblock(lines: PackedStringArray, start: int, entry_indent: 
 	var i := start
 	while i < lines.size():
 		var l := lines[i]
-		if l.strip_edges().is_empty():
+		if _is_blank_or_comment(l):
 			i += 1
 			continue
 		# A line at or above the parent entry's indent ends the nested block.
@@ -308,6 +315,14 @@ static func _emit_scalar(v: Variant) -> String:
 			return str(float(v))
 		_:
 			return str(v)
+
+
+## Blank and comment-only lines carry no structure — every scan loop skips
+## them the same way so a `# comment` can never be mistaken for an entry
+## header or a key/value line.
+static func _is_blank_or_comment(line: String) -> bool:
+	var stripped := line.strip_edges()
+	return stripped.is_empty() or stripped.begins_with("#")
 
 
 ## Returns the leading-whitespace indent width of a line (spaces + tabs

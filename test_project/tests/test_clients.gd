@@ -2614,6 +2614,48 @@ func test_hermes_yaml_empty_block_does_not_swallow_sibling_key() -> void:
 	DirAccess.remove_absolute(path)
 
 
+func test_hermes_yaml_comments_in_block_are_not_parsed_as_entries() -> void:
+	## Corruption regression: comment lines inside the mcp_servers block —
+	## at entry indent or inside an entry — must never be parsed as entry
+	## headers or keys (a `# note` entry would be re-emitted as a bogus
+	## `# note:` server on rewrite).
+	var c := McpClientRegistry.get_by_id("hermes")
+	var dir := OS.get_environment("TMPDIR")
+	if dir.is_empty():
+		dir = OS.get_environment("TEMP")
+	if dir.is_empty():
+		dir = "/tmp"
+	var path := dir.path_join("godot_ai_hermes_comments.yaml")
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "could not open temp yaml")
+	f.store_string(
+		"mcp_servers:\n"
+		+ "  # my github server\n"
+		+ "  github:\n"
+		+ "    # auth for CI\n"
+		+ "    url: \"https://mcp.github.com/mcp\"\n"
+	)
+	f.close()
+
+	var real_path := c.path_template
+	c.path_template = {"unix": path, "windows": path}
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	c.path_template = real_path
+	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
+
+	var reread := FileAccess.get_file_as_string(path)
+	assert_contains(reread, "godot-ai:")
+	assert_contains(reread, "github:")
+	assert_contains(reread, "url: https://mcp.github.com/mcp")
+	assert_false(reread.contains("# my github server:"),
+		"a comment must never be re-emitted as an entry, got:\n%s" % reread)
+	assert_false(reread.contains("# auth for CI:"),
+		"an in-entry comment must never become a key, got:\n%s" % reread)
+	DirAccess.remove_absolute(path)
+
+
 func test_hermes_yaml_reconfigure_preserves_user_headers_drops_stdio_keys() -> void:
 	## Reconfigure preservation contract (mirrors JSON's entry_initial_fields
 	## split): user-mutable keys like `headers` survive a repoint; stale

@@ -18,7 +18,10 @@ func _init() -> void:
 	}
 
 	# Hermes uses the snake_case `mcp_servers` key (not `mcpServers`).
-	server_key_path = ["mcp_servers"]
+	# PackedStringArray explicitly, matching every other descriptor — an
+	# untyped Array literal relies on implicit conversion that newer Godot
+	# builds enforce more strictly (the #722 CI lesson for Array[String]).
+	server_key_path = PackedStringArray(["mcp_servers"])
 
 	# HTTP entries use `url` (+ optional `headers`); transport is inferred —
 	# there is no `type` field in Hermes MCP config.
