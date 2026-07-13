@@ -80,10 +80,10 @@ covers:
 - **Claude Code**, **Claude Desktop**, **Antigravity**
 
 <details>
-<summary><strong>…and 16+ more clients</strong></summary>
+<summary><strong>…and 17+ more clients</strong></summary>
 
 Codex, Cursor, Devin Desktop (formerly Windsurf), VS Code, VS Code Insiders, Zed, Gemini CLI, Cline,
-Kilo Code, Roo Code, Kiro, Trae, Cherry Studio, OpenCode, Qwen Code,
+Kilo Code, Roo Code, Zoo Code, Kiro, Trae, Cherry Studio, OpenCode, Qwen Code,
 Kimi Code.
 
 </details>
