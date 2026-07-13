@@ -999,6 +999,18 @@ func get_node_properties(params: Dictionary) -> Dictionary:
 		)
 	var field_filter := {}
 	for f in fields_param:
+		## Property names are strings on the wire; anything else is a
+		## malformed filter (e.g. [123] or [["fov"]]) — reject rather than
+		## silently stringify into a filter that matches nothing (#123/#126:
+		## strict within the accepted shape). StringName is allowed for
+		## editor-side callers.
+		if not (f is String or f is StringName):
+			return ErrorCodes.make(
+				ErrorCodes.INVALID_PARAMS,
+				"'fields' elements must be property-name strings, got %s in %s" % [
+					type_string(typeof(f)), str(fields_param),
+				],
+			)
 		field_filter[str(f)] = true
 	var use_field_filter := not field_filter.is_empty()
 
