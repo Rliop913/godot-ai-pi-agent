@@ -5097,6 +5097,31 @@ async def test_material_apply_to_node_forwards_save_to():
     assert sent["save_to"] == "res://materials/my_mat.tres"
 
 
+async def test_material_apply_to_node_forwards_overwrite_with_save_to():
+    ## #685: overwrite defaults to False and travels only alongside save_to —
+    ## the plugin's clobber guard keys on it, so an inline apply (no save_to)
+    ## must not carry the flag at all.
+    client = StubClient()
+    runtime = DirectRuntime(registry=SessionRegistry(), client=client)
+    await material_handlers.material_apply_to_node(
+        runtime,
+        node_path="/Main/Box",
+        save_to="res://materials/my_mat.tres",
+    )
+    assert client.calls[-1]["params"]["overwrite"] is False
+
+    await material_handlers.material_apply_to_node(
+        runtime,
+        node_path="/Main/Box",
+        save_to="res://materials/my_mat.tres",
+        overwrite=True,
+    )
+    assert client.calls[-1]["params"]["overwrite"] is True
+
+    await material_handlers.material_apply_to_node(runtime, node_path="/Main/Box")
+    assert "overwrite" not in client.calls[-1]["params"]
+
+
 async def test_material_apply_preset_handler():
     client = StubClient()
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
