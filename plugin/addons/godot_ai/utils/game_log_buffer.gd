@@ -65,6 +65,13 @@ func error_total() -> int:
 	return _error_total
 
 
+## Warn-level lines for the current run: the combined error+warn tally minus
+## the error-only tally. Feeds the `game_warn` watermark component so a run
+## that only emitted push_warning is no longer reported as clean.
+func warn_total() -> int:
+	return _error_warn_total - _error_total
+
+
 func get_run_range(run_id: String, offset: int, count: int) -> Array[Dictionary]:
 	return get_run_page(run_id, offset, count).entries
 

@@ -48,6 +48,13 @@ class Session:
     readiness: str = "ready"
     error_watermark: dict[str, int] = field(default_factory=dict)
     pending_new_errors: int = 0
+    ## Warnings ride a channel parallel to pending_new_errors: the plugin's
+    ## warn-level buffer counters accumulate here as a separate delta, consumed
+    ## once into `new_warnings_since_last_call` on the next surfaceable success
+    ## response. Kept distinct from errors so a warning-only run is reported
+    ## (it previously read as "clean" — the error-only watermark filter dropped
+    ## every warning).
+    pending_new_warnings: int = 0
     editor_pid: int = 0
     ## Which launcher tier the plugin resolved the Python server from —
     ## "dev_venv" | "uvx" | "system" | "unknown". Lets agents notice when a

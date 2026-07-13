@@ -316,7 +316,12 @@ def _forward_error_watermark_stamp(result: dict, response: dict) -> None:
     first call after a broken launch is ``logs_read`` would never learn
     errors happened).
     """
-    for key in ("new_errors_since_last_call", "new_errors_hint"):
+    for key in (
+        "new_errors_since_last_call",
+        "new_errors_hint",
+        "new_warnings_since_last_call",
+        "new_warnings_hint",
+    ):
         if key in result:
             response[key] = result[key]
 

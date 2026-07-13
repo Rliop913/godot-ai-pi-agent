@@ -457,20 +457,38 @@ class GodotWebSocketServer:
             self._pending.pop(request.request_id, None)
 
 
+## Watermark components whose baseline resets each game run. The server may
+## never observe their zero between stop/start, so on an advanced run_seq the
+## current value is counted in full rather than diffed against a stale baseline.
+## `game_error_warn` is historically misnamed — it carries game-process ERROR
+## counts (see McpGameLogBuffer.error_total); `game_warn` is its warn-level
+## sibling.
+_PER_RUN_WATERMARK_KEYS = frozenset({"game_error_warn", "game_warn"})
+
+## Warn-level watermark components. Split out from error components so a
+## warning-only run surfaces as `new_warnings_since_last_call` instead of
+## reading as clean. Editor and game warn streams are independent processes
+## with no overlap, so their deltas sum (unlike the error path, where the game
+## buffer and Debugger Errors tab are two views of one stream).
+_WARN_WATERMARK_KEYS = frozenset({"editor_ring_warn", "game_warn"})
+
+
 def _sync_error_watermark_for_session(session: Session, value: dict[str, int]) -> None:
-    """Fold a plugin-stamped watermark into the session's error counters.
+    """Fold a plugin-stamped watermark into the session's counters.
 
     Side effects only: updates ``session.error_watermark`` to the incoming
-    component values and adds the newly observed error count to
-    ``session.pending_new_errors``.
+    component values, adds the newly observed error count to
+    ``session.pending_new_errors``, and accumulates newly observed warnings
+    onto ``session.pending_new_warnings`` as a parallel,
+    independently-consumed channel.
 
-    Watermark components reset independently. When run_seq advances, the
-    per-run game component is counted in full because the server may never
-    observe its zero between stop/start. Editor and debugger components remain
+    Watermark components reset independently. When run_seq advances, per-run
+    game components are counted in full because the server may never observe
+    their zero between stop/start. Editor and debugger components remain
     session-scoped monotonic deltas; a decrease is treated as a reset and the
     current component value is counted when above zero. The debugger and game
-    components overlap (both observe the running game's script errors), so
-    their deltas are combined with max(), not summed.
+    error components overlap (both observe the running game's script errors),
+    so their deltas are combined with max(), not summed.
     """
 
     updates: dict[str, int] = {}
@@ -493,14 +511,19 @@ def _sync_error_watermark_for_session(session: Session, value: dict[str, int]) -
         previous = session.error_watermark.get(key)
         if previous is not None:
             previous_int = max(0, int(previous))
-            if run_advanced and key == "game_error_warn":
+            if run_advanced and key in _PER_RUN_WATERMARK_KEYS:
                 deltas[key] = current
             elif current >= previous_int:
                 deltas[key] = current - previous_int
             else:
                 deltas[key] = current
-        elif run_advanced and key == "game_error_warn":
+        elif run_advanced and key in _PER_RUN_WATERMARK_KEYS:
             deltas[key] = current
+
+    ## Warnings first — pull them out before the error math so they can't be
+    ## conflated with the error total. Independent process streams, so sum.
+    new_warnings = sum(deltas.pop(key, 0) for key in _WARN_WATERMARK_KEYS)
+
     ## A running game's script errors surface twice: in the game log buffer
     ## (game_error_warn) and as Debugger Errors-tab rows (debugger_promoted).
     ## Those are alternate views of the same error stream — summing them
@@ -511,6 +534,7 @@ def _sync_error_watermark_for_session(session: Session, value: dict[str, int]) -
     new_total = overlap + sum(deltas.values())
     session.error_watermark.update(updates)
     session.pending_new_errors += new_total
+    session.pending_new_warnings += new_warnings
 
 
 def _normalized_watermark_int(value: object) -> int | None:
