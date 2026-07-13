@@ -6,7 +6,6 @@ func _init() -> void:
 	id = "zoo_code"
 	display_name = "Zoo Code"
 	config_type = "json"
-	doc_url = "https://docs.zoocode.dev/features/mcp/using-mcp-in-zoo"
 	path_template = {
 		"darwin": "~/Library/Application Support/Code/User/globalStorage/zoocodeorganization.zoo-code/settings/mcp_settings.json",
 		"windows": "$APPDATA/Code/User/globalStorage/zoocodeorganization.zoo-code/settings/mcp_settings.json",
