@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -294,22 +294,160 @@ async def test_dispatch_rejects_non_dict_params():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unwraps_typeerror_from_handler():
-    async def picky(rt, path):
-        del rt, path  ## absorb unused args; the test only cares about the raise below
-        raise TypeError("missing 1 required positional argument: 'value'")
+async def test_dispatch_propagates_async_body_typeerror_as_internal():
+    """#714: the TypeError catch exists for BINDING errors (bad kwargs).
 
-    with pytest.raises(GodotCommandError) as exc:
+    A genuine TypeError raised inside an *async handler body* is an internal
+    bug and must propagate as-is — the pre-fix behavior awaited inside the
+    try and misreported it as INVALID_PARAMS blaming the caller's params.
+    (This replaces the defect-locking test that pinned the old behavior,
+    updated as one unit with the narrowed try per the audit item.)
+    """
+
+    async def buggy(rt, path):
+        del rt, path
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    with pytest.raises(TypeError, match="not subscriptable"):
         await dispatch_manage_op(
-            ops={"go": picky},
+            ops={"go": buggy},
             tool_name="x_manage",
             runtime=None,
             op="go",
             params={"path": "/foo"},
         )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scalar_pin_rejects_type_confusion():
+    """#714: annotated scalar params are validated Python-side before
+    dispatch — a bool where an int belongs is the classic confusion that
+    used to surface as an opaque plugin-side crash."""
+
+    async def sized(rt, count: int):
+        del rt
+        return {"count": count}
+
+    with pytest.raises(GodotCommandError) as exc:
+        await dispatch_manage_op(
+            ops={"go": sized},
+            tool_name="x_manage",
+            runtime=None,
+            op="go",
+            params={"count": True},
+        )
     assert exc.value.code == ErrorCode.INVALID_PARAMS
-    assert "x_manage.go" in exc.value.message
-    assert exc.value.data["received"] == ["path"]
+    assert "'count'" in exc.value.message
+    assert "int" in exc.value.message
+    assert exc.value.data["param"] == "count"
+    assert exc.value.data["received_type"] == "bool"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scalar_pin_accepts_valid_scalars():
+    async def mixed(rt, name: str, count: int, ratio: float, flag: bool, maybe: str | None = None):
+        del rt
+        return {"name": name, "count": count, "ratio": ratio, "flag": flag, "maybe": maybe}
+
+    result = await dispatch_manage_op(
+        ops={"go": mixed},
+        tool_name="x_manage",
+        runtime=None,
+        op="go",
+        ## ratio as int is legitimate — JSON has one number type.
+        params={"name": "a", "count": 3, "ratio": 2, "flag": True, "maybe": None},
+    )
+    assert result == {"name": "a", "count": 3, "ratio": 2, "flag": True, "maybe": None}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scalar_pin_unwraps_annotated_params():
+    """Annotated[int, ...] params get the same pin as bare int.
+
+    Annotated must be importable at module scope: with stringified
+    annotations (PEP 563), get_type_hints resolves names against module
+    globals, and an unresolvable annotation silently disables the pin.
+    """
+
+    async def sized(rt, count: Annotated[int, "node count"]):
+        del rt
+        return {"count": count}
+
+    with pytest.raises(GodotCommandError) as exc:
+        await dispatch_manage_op(
+            ops={"go": sized},
+            tool_name="x_manage",
+            runtime=None,
+            op="go",
+            params={"count": "3"},
+        )
+    assert exc.value.code == ErrorCode.INVALID_PARAMS
+    assert exc.value.data["param"] == "count"
+
+    result = await dispatch_manage_op(
+        ops={"go": sized},
+        tool_name="x_manage",
+        runtime=None,
+        op="go",
+        params={"count": 3},
+    )
+    assert result == {"count": 3}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scalar_pin_survives_get_type_hints_failure():
+    """One unresolvable forward ref makes get_type_hints fail for the WHOLE
+    handler ({} hints), which used to silently disable every pin on it. The
+    dispatch loop now falls back to the raw signature annotation (mirroring
+    _coerce_stringified_json_values), so a param annotated with a real type
+    object keeps its pin even when a sibling annotation is broken.
+    """
+
+    async def sized(rt, count=0, broken=None):
+        del rt, broken
+        return {"count": count}
+
+    ## A real type object for `count`, an unresolvable string for `broken` —
+    ## get_type_hints raises NameError and returns nothing for either.
+    sized.__annotations__ = {"count": int, "broken": "NoSuchTypeAnywhere"}
+
+    with pytest.raises(GodotCommandError) as exc:
+        await dispatch_manage_op(
+            ops={"go": sized},
+            tool_name="x_manage",
+            runtime=None,
+            op="go",
+            params={"count": "not-an-int"},
+        )
+    assert exc.value.code == ErrorCode.INVALID_PARAMS
+    assert exc.value.data["param"] == "count"
+
+    result = await dispatch_manage_op(
+        ops={"go": sized},
+        tool_name="x_manage",
+        runtime=None,
+        op="go",
+        params={"count": 3},
+    )
+    assert result == {"count": 3}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scalar_pin_rejects_container_for_str():
+    async def named(rt, name: str):
+        del rt
+        return {"name": name}
+
+    with pytest.raises(GodotCommandError) as exc:
+        await dispatch_manage_op(
+            ops={"go": named},
+            tool_name="x_manage",
+            runtime=None,
+            op="go",
+            params={"name": {"nested": True}},
+        )
+    assert exc.value.code == ErrorCode.INVALID_PARAMS
+    assert exc.value.data["param"] == "name"
 
 
 @pytest.mark.asyncio
@@ -495,6 +633,28 @@ async def test_dispatch_leaves_json_shaped_string_for_str_annotated_param():
         params={"label": '{"not": "decoded"}'},
     )
     assert captured["label"] == '{"not": "decoded"}'
+
+
+@pytest.mark.asyncio
+async def test_dispatch_never_decodes_union_with_str_param():
+    """#714: a str-accepting union arm means a JSON-shaped string is a
+    legitimate literal — `list[str] | str` params must never be decoded,
+    or a text payload starting with "[" gets mangled into a list."""
+    captured: dict[str, Any] = {}
+
+    async def handler(rt, target: list[str] | str):
+        del rt
+        captured["target"] = target
+        return {}
+
+    await dispatch_manage_op(
+        ops={"go": handler},
+        tool_name="x_manage",
+        runtime=None,
+        op="go",
+        params={"target": '["literal", "text"]'},
+    )
+    assert captured["target"] == '["literal", "text"]'
 
 
 @pytest.mark.asyncio
