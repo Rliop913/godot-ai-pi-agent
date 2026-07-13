@@ -384,9 +384,16 @@ func _install_zip_file(
 	f.flush()
 	var write_error := f.get_error()
 	f.close()
-	var written_size := FileAccess.get_file_as_bytes(temp_path).size() if FileAccess.file_exists(temp_path) else -1
+	## get_length() on a read handle, not get_file_as_bytes().size() — the
+	## latter re-reads the whole file into memory per extracted entry just
+	## to learn its length.
+	var written_size := -1
+	var verify := FileAccess.open(temp_path, FileAccess.READ)
+	if verify != null:
+		written_size = verify.get_length()
+		verify.close()
 	if not stored or write_error != OK or written_size != content.size():
-		print("MCP | update extract failed: write error %d for %s (stored=%s size=%d expected=%d)" % [
+		print("MCP | update extract failed: write validation failed (error %d) for %s (stored=%s size=%d expected=%d)" % [
 			write_error,
 			temp_path,
 			stored,
