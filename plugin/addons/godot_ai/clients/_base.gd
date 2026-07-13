@@ -38,7 +38,7 @@ static func status_label(status: McpClient.Status) -> String:
 
 var id: String = ""                              ## stable key, e.g. "cursor"
 var display_name: String = ""                    ## "Cursor"
-var config_type: String = ""                     ## "json" | "toml" | "cli"
+var config_type: String = ""                     ## "json" | "toml" | "yaml" | "cli"
 
 # JSON / TOML clients ------------------------------------------------------
 ## {"darwin": "~/...", "windows": "$APPDATA/...", "linux": "$XDG_CONFIG_HOME/..."}

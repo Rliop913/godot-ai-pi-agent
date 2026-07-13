@@ -182,7 +182,15 @@ func watermark(force_debugger_scan: bool = false) -> Dictionary:
 		"run_seq": _run_seq,
 		"editor_ring": _error_appended_total(),
 		"debugger_promoted": _debugger_promoted_total,
+		## Historically misnamed: carries game-process ERROR counts only.
 		"game_error_warn": _game_error_total(),
+		## Warn-level components, parallel to the error counts above. The server
+		## diffs these into `new_warnings_since_last_call` so a warning-only run
+		## surfaces instead of reading as clean. Debugger Errors-tab warning rows
+		## are not promoted here yet (buffers cover push_warning from the game and
+		## editor parse/@tool warnings) — tracked as a follow-up.
+		"editor_ring_warn": _warn_appended_total(),
+		"game_warn": _game_warn_total(),
 	}
 
 
@@ -529,6 +537,22 @@ func _game_error_total() -> int:
 		return 0
 	if _game_log_buffer.has_method("error_total"):
 		return int(_game_log_buffer.call("error_total"))
+	return 0
+
+
+func _warn_appended_total() -> int:
+	if _editor_log_buffer == null:
+		return 0
+	if _editor_log_buffer.has_method("warn_appended_total"):
+		return int(_editor_log_buffer.call("warn_appended_total"))
+	return 0
+
+
+func _game_warn_total() -> int:
+	if _game_log_buffer == null:
+		return 0
+	if _game_log_buffer.has_method("warn_total"):
+		return int(_game_log_buffer.call("warn_total"))
 	return 0
 
 

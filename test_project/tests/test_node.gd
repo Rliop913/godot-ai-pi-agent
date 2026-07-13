@@ -153,6 +153,16 @@ func test_get_properties_fields_non_array_is_rejected() -> void:
 	assert_is_error(result, ErrorCodes.INVALID_PARAMS)
 
 
+func test_get_properties_fields_non_string_element_is_rejected() -> void:
+	## Elements must be property-name strings — [123] silently stringified
+	## would become a filter that matches nothing and look like an empty node.
+	var result := _handler.get_node_properties({
+		"path": "/Main/Camera3D",
+		"fields": ["fov", 123],
+	})
+	assert_is_error(result, ErrorCodes.INVALID_PARAMS)
+
+
 func test_get_properties_invalid_path() -> void:
 	var result := _handler.get_node_properties({"path": "/Main/Nope"})
 	assert_is_error(result, ErrorCodes.NODE_NOT_FOUND)

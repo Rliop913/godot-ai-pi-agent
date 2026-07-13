@@ -50,7 +50,7 @@ func test_registry_loads_all_clients() -> void:
 	var ids := McpClientRegistry.ids()
 	assert_gt(ids.size(), 10, "Expected at least 10 registered clients, got %d" % ids.size())
 	# Each existing client must remain registered for behaviour parity.
-	for required in ["claude_code", "claude_desktop", "codex", "antigravity"]:
+	for required in ["claude_code", "claude_desktop", "codex", "antigravity", "zoo_code", "hermes"]:
 		assert_true(McpClientRegistry.has_id(required), "Missing client: %s" % required)
 
 
@@ -88,9 +88,14 @@ func test_every_client_has_required_fields() -> void:
 	for client in McpClientRegistry.all():
 		assert_true(not client.id.is_empty(), "Client missing id: %s" % client)
 		assert_true(not client.display_name.is_empty(), "%s missing display_name" % client.id)
-		assert_contains(["json", "toml", "cli"], client.config_type, "%s has unexpected config_type %s" % [client.id, client.config_type])
+		assert_contains(["json", "toml", "yaml", "cli"], client.config_type, "%s has unexpected config_type %s" % [client.id, client.config_type])
 		if client.config_type == "json":
 			assert_gt(client.server_key_path.size(), 0, "%s missing server_key_path" % client.id)
+		elif client.config_type == "yaml":
+			## The YAML strategy reads the block name from server_key_path[0]
+			## and writes the url under entry_url_field — both must be set.
+			assert_gt(client.server_key_path.size(), 0, "%s yaml client missing server_key_path" % client.id)
+			assert_true(not client.entry_url_field.is_empty(), "%s yaml client missing entry_url_field" % client.id)
 		elif client.config_type == "cli":
 			assert_gt(client.cli_names.size(), 0, "%s cli client missing cli_names" % client.id)
 			assert_gt(client.cli_register_template.size(), 0, "%s cli client missing cli_register_template" % client.id)
@@ -1737,6 +1742,33 @@ func test_atomic_write_cleans_up_tmp_on_success() -> void:
 	)
 
 
+func test_atomic_write_written_size_matches_detects_match() -> void:
+	## Direct unit test of the primitive the rename-commit gate (#687) relies
+	## on: an intact write must report a match.
+	var path := _scratch_dir.path_join("size_match_ok.txt")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string("hello world")
+	f.close()
+	assert_true(McpAtomicWrite._written_size_matches(path, "hello world"))
+
+
+func test_atomic_write_written_size_matches_detects_truncation() -> void:
+	## Simulates the disk-full failure mode #687 guards against: the on-disk
+	## file is shorter than what was supposed to be written (a truncated
+	## store_string). `_written_size_matches` must catch the mismatch so the
+	## rename-commit gate added to `write()` can refuse to commit it.
+	var path := _scratch_dir.path_join("size_match_truncated.txt")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string("hello")  # on-disk bytes shorter than the intended content
+	f.close()
+	assert_false(McpAtomicWrite._written_size_matches(path, "hello world"))
+
+
+func test_atomic_write_written_size_matches_missing_file() -> void:
+	var missing := _scratch_dir.path_join("does_not_exist.txt")
+	assert_false(McpAtomicWrite._written_size_matches(missing, "anything"))
+
+
 func test_atomic_write_preserves_destination_when_swap_fails() -> void:
 	## Direct simulation of a Windows AV / lock failure is not portable, but
 	## the on-disk invariant for #297 finding #10 is testable: when the
@@ -2319,6 +2351,33 @@ func test_kilo_code_verify_flags_pre_fix_typeless_entry_as_drift() -> void:
 	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
 
 
+func test_zoo_code_pins_streamable_http_transport() -> void:
+	## Zoo Code uses the Roo-family `mcp_settings.json` / `mcpServers` shape.
+	## Pin `type: streamable-http` so a fresh entry negotiates against our
+	## streamable-http endpoint without relying on upstream defaults.
+	var c := McpClientRegistry.get_by_id("zoo_code")
+	var entry := McpJsonStrategy.build_entry(c, "http://x")
+	assert_eq(entry.get("type", ""), "streamable-http")
+	assert_eq(entry.get("url", ""), "http://x")
+	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/zoo.json")
+	assert_contains(manual, "\"type\": \"streamable-http\"")
+
+
+func test_zoo_code_verify_flags_typeless_entry_as_drift() -> void:
+	## Local extension inspection confirmed Zoo stores MCP settings in the same
+	## `mcp_settings.json` shape as Roo. A typeless legacy entry must therefore
+	## register as drift so Configure rewrites it with the transport pin.
+	var c := McpClientRegistry.get_by_id("zoo_code")
+	var current := McpJsonStrategy.build_entry(c, "http://x")
+	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
+	var legacy_typeless := {"url": "http://x", "disabled": false, "alwaysAllow": []}
+	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "typeless Zoo entry must register as drift")
+	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "alwaysAllow": []}
+	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
+	var url_drift := {"type": "streamable-http", "url": "http://other", "disabled": false, "alwaysAllow": []}
+	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
+
+
 # ----- entry_initial_fields: user-state preservation across reconfigure -----
 
 func test_verify_entry_ignores_initial_field_drift() -> void:
@@ -2392,6 +2451,227 @@ func test_build_entry_force_overwrites_drifted_required_fields() -> void:
 	var rebuilt := McpJsonStrategy.build_entry(c, "http://new/mcp", legacy_sse)
 	assert_eq(rebuilt.get("type"), "streamable-http", "type pin must overwrite legacy SSE")
 	assert_eq(rebuilt.get("alwaysAllow"), ["session_manage"], "user state still preserved across the type fix")
+
+
+# ----- hermes -----
+
+func test_hermes_is_registered() -> void:
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_true(c != null, "hermes client must be registered")
+	assert_eq(c.display_name, "Hermes Agent")
+	assert_eq(c.config_type, "yaml")
+
+
+func test_hermes_entry_is_url_only_no_transport_type() -> void:
+	## Hermes HTTP entries are transport-inferred: just `url`, no `type`
+	## field. The official shape is `mcp_servers: { url: ... }`.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var entry := McpYamlStrategy.build_entry(c, "http://x")
+	assert_eq(entry.get("url", ""), "http://x")
+	assert_false(entry.has("type"), "Hermes entries must NOT carry a type field")
+	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/hermes/config.yaml")
+	assert_contains(manual, "mcp_servers")
+	assert_contains(manual, "url: http://x")
+	assert_false(manual.contains("type:"), "manual hint must not mention a type field")
+
+
+func test_hermes_entry_verifies_as_match() -> void:
+	## The standard entry shape must round-trip through verify_entry so the
+	## dock shows a green CONFIGURED dot.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var entry := McpYamlStrategy.build_entry(c, "http://x")
+	assert_true(McpYamlStrategy.verify_entry(c, entry, "http://x"),
+		"built entry must verify as a match")
+
+
+func test_hermes_verify_flags_url_drift_as_drift() -> void:
+	## A Hermes entry whose URL doesn't match must register as drift so the
+	## dock prompts reconfiguration. Verify only checks url (transport is
+	## inferred, so there is no type field to drift on).
+	var c := McpClientRegistry.get_by_id("hermes")
+	var current := McpYamlStrategy.build_entry(c, "http://x")
+	assert_true(McpYamlStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
+	var url_drift := {"url": "http://other"}
+	assert_false(McpYamlStrategy.verify_entry(c, url_drift, "http://x"),
+		"URL drift must register as drift")
+
+
+func test_hermes_windows_path_template_uses_local_appdata() -> void:
+	## Hermes stores MCP config at $LOCALAPPDATA/hermes/config.yaml on
+	## Windows (Local, not Roaming — confirmed by where the running Hermes
+	## process reads; see the descriptor's comment). $VAR is the token shape
+	## McpPathTemplate.expand actually substitutes — %VAR% would be left as a
+	## literal invalid path and the write would land in a bogus location.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_true(c != null, "hermes client must be registered")
+	assert_true(c.path_template.has("windows"), "hermes descriptor must declare a windows path_template")
+	var windows_template: String = c.path_template["windows"]
+	assert_contains(windows_template, "$LOCALAPPDATA",
+		"windows template must use $LOCALAPPDATA, got: %s" % windows_template)
+	assert_contains(windows_template, "config.yaml",
+		"windows template must point at config.yaml, got: %s" % windows_template)
+
+
+func test_hermes_unix_path_template_uses_home() -> void:
+	## Hermes stores MCP config at ~/.hermes/config.yaml on Unix.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_true(c != null)
+	assert_true(c.path_template.has("unix"), "hermes descriptor must declare a unix path_template")
+	assert_eq(c.path_template["unix"], "~/.hermes/config.yaml")
+
+
+func test_hermes_uses_snake_case_mcp_servers_key() -> void:
+	## Hermes uses the snake_case `mcp_servers` key, NOT `mcpServers`.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_eq(c.server_key_path[0], "mcp_servers")
+
+
+func test_hermes_has_no_uvx_bridge() -> void:
+	## Hermes Agent is HTTP-native — no uvx mcp-proxy bridge needed.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_eq(c.entry_uvx_bridge, McpClient.UvxBridge.NONE)
+
+
+func test_hermes_is_in_required_registry_check() -> void:
+	## Ensure test_registry_loads_all_clients would not break if this test
+	## was added to the required client list — just a forward-compat guard.
+	assert_true(McpClientRegistry.has_id("hermes"), "hermes client must be in registry")
+
+
+func test_hermes_yaml_roundtrips_through_configure() -> void:
+	## End-to-end: a configure write must produce YAML Hermes can read back
+	## as CONFIGURED, preserving other top-level keys in the user's file.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var dir := OS.get_environment("TMPDIR")
+	if dir.is_empty():
+		dir = OS.get_environment("TEMP")
+	if dir.is_empty():
+		dir = "/tmp"
+	var path := dir.path_join("godot_ai_hermes_rt.yaml")
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	# Seed a config.yaml with an unrelated top-level key.
+	var seed := "model: openai/gpt-4o\nmcp_servers:\n  github:\n    url: \"https://mcp.github.com/mcp\"\n"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "could not open temp yaml")
+	f.store_string(seed)
+	f.close()
+
+	# Point the descriptor at our temp file for this test.
+	var real_path := c.path_template
+	c.path_template = {"unix": path, "windows": path}
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	c.path_template = real_path
+	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
+
+	# Read back and assert shape.
+	var reread := FileAccess.get_file_as_string(path)
+	assert_contains(reread, "mcp_servers:")
+	assert_contains(reread, "godot-ai:")
+	assert_contains(reread, "url: http://127.0.0.1:8000/mcp")
+	# Unrelated key preserved.
+	assert_contains(reread, "model: openai/gpt-4o")
+	# github entry preserved.
+	assert_contains(reread, "github:")
+	DirAccess.remove_absolute(path)
+
+
+func test_hermes_yaml_empty_block_does_not_swallow_sibling_key() -> void:
+	## Corruption regression: an EMPTY `mcp_servers:` block followed by a
+	## top-level sibling key. The block parser must not consume the sibling
+	## as a server entry — that would re-emit `model:` nested under
+	## mcp_servers on rewrite and corrupt the user's config.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var dir := OS.get_environment("TMPDIR")
+	if dir.is_empty():
+		dir = OS.get_environment("TEMP")
+	if dir.is_empty():
+		dir = "/tmp"
+	var path := dir.path_join("godot_ai_hermes_empty_block.yaml")
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "could not open temp yaml")
+	f.store_string("mcp_servers:\nmodel: openai/gpt-4o\n")
+	f.close()
+
+	var real_path := c.path_template
+	c.path_template = {"unix": path, "windows": path}
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	c.path_template = real_path
+	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
+
+	var reread := FileAccess.get_file_as_string(path)
+	assert_contains(reread, "godot-ai:")
+	# model must survive AT TOP LEVEL — never indented under mcp_servers.
+	var has_top_level_model := false
+	for line in reread.split("\n"):
+		if String(line).begins_with("model: openai/gpt-4o"):
+			has_top_level_model = true
+			break
+	assert_true(has_top_level_model, "sibling key must stay top-level, got:\n%s" % reread)
+	assert_false(reread.contains("  model:"), "sibling key must not be nested under mcp_servers, got:\n%s" % reread)
+	DirAccess.remove_absolute(path)
+
+
+func test_hermes_yaml_comments_in_block_are_not_parsed_as_entries() -> void:
+	## Corruption regression: comment lines inside the mcp_servers block —
+	## at entry indent or inside an entry — must never be parsed as entry
+	## headers or keys (a `# note` entry would be re-emitted as a bogus
+	## `# note:` server on rewrite).
+	var c := McpClientRegistry.get_by_id("hermes")
+	var dir := OS.get_environment("TMPDIR")
+	if dir.is_empty():
+		dir = OS.get_environment("TEMP")
+	if dir.is_empty():
+		dir = "/tmp"
+	var path := dir.path_join("godot_ai_hermes_comments.yaml")
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "could not open temp yaml")
+	f.store_string(
+		"mcp_servers:\n"
+		+ "  # my github server\n"
+		+ "  github:\n"
+		+ "    # auth for CI\n"
+		+ "    url: \"https://mcp.github.com/mcp\"\n"
+	)
+	f.close()
+
+	var real_path := c.path_template
+	c.path_template = {"unix": path, "windows": path}
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	c.path_template = real_path
+	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
+
+	var reread := FileAccess.get_file_as_string(path)
+	assert_contains(reread, "godot-ai:")
+	assert_contains(reread, "github:")
+	assert_contains(reread, "url: https://mcp.github.com/mcp")
+	assert_false(reread.contains("# my github server:"),
+		"a comment must never be re-emitted as an entry, got:\n%s" % reread)
+	assert_false(reread.contains("# auth for CI:"),
+		"an in-entry comment must never become a key, got:\n%s" % reread)
+	DirAccess.remove_absolute(path)
+
+
+func test_hermes_yaml_reconfigure_preserves_user_headers_drops_stdio_keys() -> void:
+	## Reconfigure preservation contract (mirrors JSON's entry_initial_fields
+	## split): user-mutable keys like `headers` survive a repoint; stale
+	## stdio-bridge keys (`command`) are scrubbed so Hermes never sees both a
+	## url and a command on one entry.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var existing := {
+		"url": "http://old:1234/mcp",
+		"command": "uvx mcp-proxy",
+		"headers": {"Authorization": "Bearer abc"},
+	}
+	var entry := McpYamlStrategy.build_entry(c, "http://127.0.0.1:8000/mcp", existing)
+	assert_eq(entry.get("url", ""), "http://127.0.0.1:8000/mcp", "url must be repointed")
+	assert_false(entry.has("command"), "stdio-bridge command must be scrubbed")
+	var headers: Dictionary = entry.get("headers", {})
+	assert_eq(headers.get("Authorization", ""), "Bearer abc", "user headers must survive reconfigure")
 
 
 func test_opencode_client_uses_home_config_on_windows() -> void:

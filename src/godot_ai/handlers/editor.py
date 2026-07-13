@@ -307,16 +307,22 @@ async def logs_read(
 
 
 def _forward_error_watermark_stamp(result: dict, response: dict) -> None:
-    """Carry the client-injected error-watermark hint through a rebuild.
+    """Carry the client-injected error/warning-watermark hints through a rebuild.
 
-    ``GodotClient.send`` consumes ``Session.pending_new_errors`` into the raw
-    command result exactly once. A handler that rebuilds its response instead
-    of passing the result through must re-attach the stamp, or the one
-    delivery is silently destroyed — the #641 failure mode (an agent whose
-    first call after a broken launch is ``logs_read`` would never learn
-    errors happened).
+    ``GodotClient.send`` consumes ``Session.pending_new_errors`` and
+    ``Session.pending_new_warnings`` into the raw command result exactly
+    once. A handler that rebuilds its response instead of passing the result
+    through must re-attach the stamps, or the one delivery is silently
+    destroyed — the #641 failure mode (an agent whose first call after a
+    broken launch is ``logs_read`` would never learn errors or warnings
+    happened).
     """
-    for key in ("new_errors_since_last_call", "new_errors_hint"):
+    for key in (
+        "new_errors_since_last_call",
+        "new_errors_hint",
+        "new_warnings_since_last_call",
+        "new_warnings_hint",
+    ):
         if key in result:
             response[key] = result[key]
 
