@@ -733,6 +733,124 @@ func test_path_template_xdg_fallback() -> void:
 	assert_true(resolved.ends_with("/foo"))
 
 
+# ----- env snapshot (#691) -----
+
+const TEST_SNAPSHOT_ENV := "GODOT_AI_TEST_ENV_SNAPSHOT"
+
+
+func test_env_lookup_main_thread_reads_live_and_refreshes_snapshot() -> void:
+	OS.set_environment(TEST_SNAPSHOT_ENV, "live-value")
+	assert_eq(McpPathTemplate.env_lookup(TEST_SNAPSHOT_ENV), "live-value")
+	OS.set_environment(TEST_SNAPSHOT_ENV, "updated-value")
+	assert_eq(McpPathTemplate.env_lookup(TEST_SNAPSHOT_ENV), "updated-value",
+		"main-thread reads must always be live, never stale snapshot")
+	OS.unset_environment(TEST_SNAPSHOT_ENV)
+
+
+func test_env_lookup_worker_thread_serves_snapshot_not_live_env() -> void:
+	## The #691 contract: a worker-thread read must come from the snapshot,
+	## proving it can never call OS.get_environment concurrently with a
+	## main-thread setenv/unsetenv window. We change the real env AFTER
+	## warming and assert the worker still sees the warmed value.
+	OS.set_environment(TEST_SNAPSHOT_ENV, "warmed-value")
+	McpPathTemplate.warm_env_snapshot(PackedStringArray([TEST_SNAPSHOT_ENV]))
+	OS.set_environment(TEST_SNAPSHOT_ENV, "mutated-after-warm")
+
+	var thread := Thread.new()
+	var start_err := thread.start(func() -> String:
+		return McpPathTemplate.env_lookup(TEST_SNAPSHOT_ENV)
+	)
+	assert_eq(start_err, OK, "worker thread must start")
+	var worker_value := str(thread.wait_to_finish())
+
+	assert_eq(worker_value, "warmed-value",
+		"worker read must be served from the snapshot, not the live env")
+	## Main-thread read refreshes the snapshot to the current live value.
+	assert_eq(McpPathTemplate.env_lookup(TEST_SNAPSHOT_ENV), "mutated-after-warm")
+	OS.unset_environment(TEST_SNAPSHOT_ENV)
+
+
+func test_env_lookup_worker_thread_never_warmed_var_reads_empty() -> void:
+	## A worker read of a var nobody warmed must return "" (the unset
+	## value), NOT fall back to a live OS.get_environment — the fallback
+	## would reintroduce the #691 race for exactly the un-warmed vars.
+	const NEVER_WARMED := "GODOT_AI_TEST_ENV_NEVER_WARMED"
+	OS.set_environment(NEVER_WARMED, "live-only-value")
+	var thread := Thread.new()
+	var start_err := thread.start(func() -> String:
+		return McpPathTemplate.env_lookup(NEVER_WARMED)
+	)
+	assert_eq(start_err, OK, "worker thread must start")
+	var worker_value := str(thread.wait_to_finish())
+	OS.unset_environment(NEVER_WARMED)
+	assert_eq(worker_value, "",
+		"un-warmed worker read must degrade to \"\", never touch the live env")
+
+
+func test_editor_setting_lookup_worker_thread_serves_snapshot() -> void:
+	## #691: mode_override() runs on the startup walk's discovery worker
+	## (via get_server_command) and EditorSettings is not thread-safe. A
+	## worker read must come from the main-thread-warmed snapshot; a
+	## never-warmed key must read as null (unset), never touch
+	## EditorInterface off-main.
+	var es := EditorInterface.get_editor_settings()
+	var setting_name := McpClientConfigurator.MODE_OVERRIDE_SETTING
+	var had_setting := es.has_setting(setting_name)
+	var prior: Variant = es.get_setting(setting_name) if had_setting else null
+	es.set_setting(setting_name, "dev")
+	McpClientConfigurator.warm_env_snapshot()
+
+	var thread := Thread.new()
+	var start_err := thread.start(func() -> Array:
+		return [
+			McpClientConfigurator._editor_setting_lookup(setting_name),
+			McpClientConfigurator._editor_setting_lookup("godot_ai/never_warmed_probe"),
+		]
+	)
+	assert_eq(start_err, OK, "worker thread must start")
+	var results: Array = thread.wait_to_finish()
+
+	if had_setting:
+		es.set_setting(setting_name, prior)
+	else:
+		es.erase(setting_name)
+	McpClientConfigurator.warm_env_snapshot()
+
+	assert_eq(str(results[0]), "dev",
+		"worker read must serve the warmed EditorSetting value")
+	assert_true(results[1] == null,
+		"a never-warmed setting must read as null on a worker, not hit EditorInterface")
+
+
+func test_warm_env_snapshot_covers_descriptor_config_home_envs() -> void:
+	## ClientConfigurator.warm_env_snapshot must include every descriptor's
+	## config_home_env (CLAUDE_CONFIG_DIR, CODEX_HOME, …) so worker-side
+	## config_home_override() never falls into the degraded un-warmed path.
+	var tested_count := 0
+	for id in McpClientConfigurator.client_ids():
+		var client := McpClientRegistry.get_by_id(String(id))
+		if client == null or client.config_home_env.is_empty():
+			continue
+		tested_count += 1
+		OS.set_environment(client.config_home_env, "warm-probe")
+		McpClientConfigurator.warm_env_snapshot()
+		OS.unset_environment(client.config_home_env)
+		var thread := Thread.new()
+		var env_name := client.config_home_env
+		var start_err := thread.start(func() -> String:
+			return McpPathTemplate.env_lookup(env_name)
+		)
+		assert_eq(start_err, OK)
+		var worker_value := str(thread.wait_to_finish())
+		assert_eq(worker_value, "warm-probe",
+			"%s must be pre-warmed by ClientConfigurator.warm_env_snapshot" % env_name)
+		## Re-warm now that the var is unset so the snapshot doesn't leak
+		## the probe value into later tests.
+		McpClientConfigurator.warm_env_snapshot()
+	assert_true(tested_count > 0,
+		"no descriptor declared config_home_env — this test exercised nothing")
+
+
 # ----- config-home env override (#617) -----
 
 const TEST_CFG_HOME_ENV := "GODOT_AI_TEST_CFG_HOME"
