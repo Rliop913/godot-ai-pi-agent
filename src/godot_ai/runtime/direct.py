@@ -30,8 +30,14 @@ class DirectRuntime:
 
     @classmethod
     def from_context(cls, ctx: Context, session_id: str | None = None) -> DirectRuntime:
-        app = ctx.fastmcp._lifespan_result
-        if app is None:
+        ## Public accessor for the value our lifespan yielded (an AppContext).
+        ## When the lifespan hasn't run it returns None or an empty dict
+        ## instead of the app object, so guard on shape rather than on None.
+        ## getattr, not attribute access: a Context-like object without the
+        ## accessor should surface as the same stable RuntimeError, not an
+        ## AttributeError.
+        app = getattr(ctx, "lifespan_context", None)
+        if not (hasattr(app, "registry") and hasattr(app, "client")):
             raise RuntimeError("FastMCP lifespan context is not available")
         return cls.from_app_context(app, session_id=session_id)
 
