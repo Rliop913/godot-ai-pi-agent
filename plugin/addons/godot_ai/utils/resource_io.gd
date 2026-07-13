@@ -95,6 +95,10 @@ static func save_to_disk(
 			ErrorCodes.INVALID_PARAMS,
 			"%s already exists at %s (pass overwrite=true to replace)" % [label, resource_path]
 		)
+	# Captured BEFORE the overwrite below so a resave of an already-uid'd file
+	# (overwrite=true) can restore its own uid instead of losing it — see
+	# ensure_uid's doc comment.
+	var prior_uid := ResourceLoader.get_resource_uid(resource_path) if existed_before else ResourceUID.INVALID_ID
 
 	var dir_path := resource_path.get_base_dir()
 	var mkdir_err := DirAccess.make_dir_recursive_absolute(dir_path)
@@ -113,6 +117,12 @@ static func save_to_disk(
 		return ErrorCodes.make(
 			ErrorCodes.INTERNAL_ERROR,
 			"Failed to save %s to %s: %s" % [label, resource_path, error_string(save_err)]
+		)
+	var uid_err := ensure_uid(resource_path, prior_uid)
+	if uid_err != OK:
+		return ErrorCodes.make(
+			ErrorCodes.INTERNAL_ERROR,
+			"%s saved to %s but failed to write its uid: %s" % [label, resource_path, error_string(uid_err)]
 		)
 
 	var efs := EditorInterface.get_resource_filesystem()
@@ -140,12 +150,38 @@ static func save_to_disk(
 ## `apply_to_node`'s inline-then-save branch). Returns the raw
 ## `ResourceSaver.save` error code.
 static func guarded_save(res: Resource, resource_path: String, pause_target: McpConnection) -> int:
+	var prior_uid := ResourceLoader.get_resource_uid(resource_path) if FileAccess.file_exists(resource_path) else ResourceUID.INVALID_ID
 	if pause_target != null:
 		pause_target.pause_processing = true
 	var save_err := ResourceSaver.save(res, resource_path)
 	if pause_target != null:
 		pause_target.pause_processing = false
-	return save_err
+	if save_err != OK:
+		return save_err
+	return ensure_uid(resource_path, prior_uid)
+
+
+## Make `resource_path` carry a stable uid after a successful
+## `ResourceSaver.save()`, matching what Godot's own "New Scene"/"New
+## Resource" editor flows always embed. A bare `ResourceSaver.save()` call
+## does neither on its own: a brand-new file gets no `uid=` at all, and
+## resaving a file that already had one silently drops it (#737). Call this
+## immediately after every successful save.
+##
+## `prior_uid` is whatever `ResourceLoader.get_resource_uid(resource_path)`
+## returned BEFORE this save overwrote the file (pass `ResourceUID.INVALID_ID`
+## for a brand-new path). Reusing the prior id — instead of always minting a
+## fresh one — keeps any `uid://...` references elsewhere in the project
+## resolving to the same file.
+##
+## Returns the `Error` from `ResourceSaver.set_uid()` so callers can surface a
+## uid-write failure instead of silently reporting success on a file that
+## didn't end up with the uid it was supposed to get.
+static func ensure_uid(resource_path: String, prior_uid: int) -> Error:
+	var id := prior_uid
+	if id == ResourceUID.INVALID_ID:
+		id = ResourceUID.create_id()
+	return ResourceSaver.set_uid(resource_path, id)
 
 
 ## Attach a `cleanup.rm` hint listing `paths` to `data` — only when the call

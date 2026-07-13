@@ -40,6 +40,19 @@ func suite_setup(_ctx: Dictionary) -> void:
 	_handler = SceneHandler.new()
 
 
+const _UID_SCENE_FIXTURE_PATH := "res://tests/_mcp_test_uid_scene.tscn"
+
+
+func suite_teardown() -> void:
+	# Guarantees cleanup even if test_create_scene_embeds_and_preserves_uid
+	# fails or aborts partway through, rather than relying on the assertion
+	# flow to reach its own cleanup line.
+	if FileAccess.file_exists(_UID_SCENE_FIXTURE_PATH):
+		var remove_err := DirAccess.remove_absolute(ProjectSettings.globalize_path(_UID_SCENE_FIXTURE_PATH))
+		if remove_err != OK:
+			push_warning("MCP test cleanup: failed to remove %s: %s" % [_UID_SCENE_FIXTURE_PATH, error_string(remove_err)])
+
+
 # ----- get_scene_tree -----
 
 func test_scene_tree_returns_data() -> void:
@@ -182,6 +195,37 @@ func test_create_scene_rejects_project_godot_overwrite() -> void:
 	## Write blocklist (audit GH-3): refuse clobbering the project manifest.
 	var result := _handler.create_scene({"path": "res://project.godot"})
 	assert_is_error(result, ErrorCodes.VALUE_OUT_OF_RANGE)
+
+
+func test_create_scene_embeds_and_preserves_uid() -> void:
+	## #737 regression. Calls SceneHandler._pack_and_save_with_uid() directly
+	## — the real save+uid sequence create_scene runs — rather than
+	## create_scene() itself: per this section's header comment, a full
+	## create switches the editor's active scene and isn't safe inside the
+	## shared test runner. This exercises production code (not a duplicated
+	## reimplementation), just without create_scene's
+	## EditorInterface.open_scene_from_path side effect. create_scene's own
+	## end-to-end wiring was additionally verified live against a running
+	## editor (scene_manage(op="create"), then a same-path recreate) during
+	## development of this fix. Cleanup is guaranteed by suite_teardown()
+	## even if an assertion below fails.
+	var out_path := _UID_SCENE_FIXTURE_PATH
+	if FileAccess.file_exists(out_path):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(out_path))
+
+	var root := Node3D.new()
+	root.name = "UidProbeRoot"
+	assert_eq(_handler._pack_and_save_with_uid(root, out_path), OK)
+	var original_uid := ResourceLoader.get_resource_uid(out_path)
+	assert_true(original_uid != ResourceUID.INVALID_ID, "freshly created scene must carry a uid")
+
+	# Recreate at the same path — mirrors create_scene being pointed at an
+	# existing scene path — and confirm the original uid survives.
+	var root2 := Node3D.new()
+	root2.name = "UidProbeRootV2"
+	assert_eq(_handler._pack_and_save_with_uid(root2, out_path), OK)
+	assert_eq(ResourceLoader.get_resource_uid(out_path), original_uid,
+		"overwriting a scene at the same path must preserve its original uid")
 
 
 # ----- open_scene (validation only — opening scenes triggers UI that blocks test runner) -----
