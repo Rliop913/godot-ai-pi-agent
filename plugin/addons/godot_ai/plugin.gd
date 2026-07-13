@@ -15,6 +15,11 @@ const EditorLogger := preload("res://addons/godot_ai/runtime/editor_logger.gd")
 const MANAGED_SERVER_PID_SETTING := "godot_ai/managed_server_pid"
 const MANAGED_SERVER_VERSION_SETTING := "godot_ai/managed_server_version"
 const MANAGED_SERVER_WS_PORT_SETTING := "godot_ai/managed_server_ws_port"
+## Per-launch WS handshake auth token (#690), generated at spawn and handed
+## to the server via the GODOT_AI_WS_TOKEN spawn env. Persisted alongside
+## the managed-server record so a reloaded plugin instance adopting the
+## same server keeps authenticating; cleared with the rest of the record.
+const MANAGED_SERVER_WS_TOKEN_SETTING := "godot_ai/managed_server_ws_token"
 const UPDATE_RELOAD_RUNNER_SCRIPT := preload("res://addons/godot_ai/update_reload_runner.gd")
 
 ## Server lifecycle + port discovery extracted from this file (#297 PR 5).
@@ -154,6 +159,12 @@ var _debugger_plugin
 var _lifecycle
 static var _server_started_this_session := false  # guard against re-entrant spawns
 static var _resolved_ws_port := ClientConfigurator.DEFAULT_WS_PORT
+## Per-launch WS handshake auth token (#690). Static for the same reason as
+## _resolved_ws_port: a plugin reload in the same editor session adopts the
+## server the previous instance spawned, and must keep its token. Empty
+## when this editor never spawned a token-carrying server (dev servers,
+## fresh installs) — the handshake then omits the field.
+static var _ws_auth_token := ""
 
 ## Server-watch timer lives on the plugin because it's a Node — the
 ## manager is RefCounted and can't host children.
@@ -230,6 +241,13 @@ func _enter_tree() -> void:
 	_connection.log_buffer = _log_buffer
 	_connection.surfaced_error_tracker = _surfaced_error_tracker
 	_connection.ws_port = _resolved_ws_port
+	## Restore the token before the first connect: after an editor restart
+	## the static is empty but the managed-server record still names the
+	## token the running server was spawned with (#690). A fresh spawn later
+	## overwrites both via _set_ws_auth_token.
+	if _ws_auth_token.is_empty():
+		_ws_auth_token = str(_read_managed_server_record().get("ws_token", ""))
+	_connection.auth_token = _ws_auth_token
 	_connection.connect_blocked = _lifecycle.is_connection_blocked()
 	_connection.connect_block_reason = _lifecycle.get_status_dict().get("message", "")
 	if (
@@ -1488,7 +1506,7 @@ func _wait_for_port_free(port: int, timeout_s: float) -> void:
 func _read_managed_server_record() -> Dictionary:
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
-		return {"pid": 0, "version": "", "ws_port": 0}
+		return {"pid": 0, "version": "", "ws_port": 0, "ws_token": ""}
 	var pid: int = 0
 	if es.has_setting(MANAGED_SERVER_PID_SETTING):
 		pid = int(es.get_setting(MANAGED_SERVER_PID_SETTING))
@@ -1498,7 +1516,10 @@ func _read_managed_server_record() -> Dictionary:
 	var ws_port: int = 0
 	if es.has_setting(MANAGED_SERVER_WS_PORT_SETTING):
 		ws_port = int(es.get_setting(MANAGED_SERVER_WS_PORT_SETTING))
-	return {"pid": pid, "version": version, "ws_port": ws_port}
+	var ws_token: String = ""
+	if es.has_setting(MANAGED_SERVER_WS_TOKEN_SETTING):
+		ws_token = str(es.get_setting(MANAGED_SERVER_WS_TOKEN_SETTING))
+	return {"pid": pid, "version": version, "ws_port": ws_port, "ws_token": ws_token}
 
 
 func _write_managed_server_record(pid: int, version: String) -> void:
@@ -1508,9 +1529,26 @@ func _write_managed_server_record(pid: int, version: String) -> void:
 	es.set_setting(MANAGED_SERVER_PID_SETTING, pid)
 	es.set_setting(MANAGED_SERVER_VERSION_SETTING, version)
 	es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, _resolved_ws_port)
+	es.set_setting(MANAGED_SERVER_WS_TOKEN_SETTING, _ws_auth_token)
+
+
+## Keep the in-memory token, the connection's handshake field, and (via the
+## next _write_managed_server_record) the persisted record in one place so
+## the three can't drift. Empty token = "send no auth_token field".
+func _set_ws_auth_token(token: String) -> void:
+	_ws_auth_token = token
+	if _connection != null:
+		_connection.auth_token = token
 
 
 func _clear_managed_server_record() -> void:
+	## Drop the in-memory token together with the persisted one: a cleared
+	## record means "no managed server", and a surviving static would make
+	## the next handshake send a stale token — the exact present-but-wrong
+	## shape a newer spawned server rejects with 4003. (Runs before the
+	## es == null early return on purpose: the in-memory scrub must not
+	## depend on EditorSettings being available.)
+	_set_ws_auth_token("")
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
 		return
@@ -1520,6 +1558,8 @@ func _clear_managed_server_record() -> void:
 		es.set_setting(MANAGED_SERVER_VERSION_SETTING, "")
 	if es.has_setting(MANAGED_SERVER_WS_PORT_SETTING):
 		es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, 0)
+	if es.has_setting(MANAGED_SERVER_WS_TOKEN_SETTING):
+		es.set_setting(MANAGED_SERVER_WS_TOKEN_SETTING, "")
 
 
 func prepare_for_update_reload() -> void:
