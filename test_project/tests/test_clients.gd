@@ -88,9 +88,14 @@ func test_every_client_has_required_fields() -> void:
 	for client in McpClientRegistry.all():
 		assert_true(not client.id.is_empty(), "Client missing id: %s" % client)
 		assert_true(not client.display_name.is_empty(), "%s missing display_name" % client.id)
-		assert_contains(["json", "toml", "cli"], client.config_type, "%s has unexpected config_type %s" % [client.id, client.config_type])
+		assert_contains(["json", "toml", "yaml", "cli"], client.config_type, "%s has unexpected config_type %s" % [client.id, client.config_type])
 		if client.config_type == "json":
 			assert_gt(client.server_key_path.size(), 0, "%s missing server_key_path" % client.id)
+		elif client.config_type == "yaml":
+			## The YAML strategy reads the block name from server_key_path[0]
+			## and writes the url under entry_url_field — both must be set.
+			assert_gt(client.server_key_path.size(), 0, "%s yaml client missing server_key_path" % client.id)
+			assert_true(not client.entry_url_field.is_empty(), "%s yaml client missing entry_url_field" % client.id)
 		elif client.config_type == "cli":
 			assert_gt(client.cli_names.size(), 0, "%s cli client missing cli_names" % client.id)
 			assert_gt(client.cli_register_template.size(), 0, "%s cli client missing cli_register_template" % client.id)
@@ -2491,14 +2496,18 @@ func test_hermes_verify_flags_url_drift_as_drift() -> void:
 		"URL drift must register as drift")
 
 
-func test_hermes_windows_path_template_uses_appdata() -> void:
-	## Hermes stores MCP config at %APPDATA%/hermes/config.yaml on Windows.
+func test_hermes_windows_path_template_uses_local_appdata() -> void:
+	## Hermes stores MCP config at $LOCALAPPDATA/hermes/config.yaml on
+	## Windows (Local, not Roaming — confirmed by where the running Hermes
+	## process reads; see the descriptor's comment). $VAR is the token shape
+	## McpPathTemplate.expand actually substitutes — %VAR% would be left as a
+	## literal invalid path and the write would land in a bogus location.
 	var c := McpClientRegistry.get_by_id("hermes")
 	assert_true(c != null, "hermes client must be registered")
 	assert_true(c.path_template.has("windows"), "hermes descriptor must declare a windows path_template")
 	var windows_template: String = c.path_template["windows"]
-	assert_contains(windows_template, "%APPDATA%",
-		"windows template must use %%APPDATA%%, got: %s" % windows_template)
+	assert_contains(windows_template, "$LOCALAPPDATA",
+		"windows template must use $LOCALAPPDATA, got: %s" % windows_template)
 	assert_contains(windows_template, "config.yaml",
 		"windows template must point at config.yaml, got: %s" % windows_template)
 
@@ -2566,6 +2575,8 @@ func test_hermes_yaml_roundtrips_through_configure() -> void:
 	assert_contains(reread, "github:")
 	DirAccess.remove_absolute(path)
 
+
+func test_opencode_client_uses_home_config_on_windows() -> void:
 	## Regression: OpenCode reads its MCP config from
 	## ~/.config/opencode/opencode.json on ALL platforms (verified via
 	## `opencode debug paths`). The Windows descriptor used to point at
