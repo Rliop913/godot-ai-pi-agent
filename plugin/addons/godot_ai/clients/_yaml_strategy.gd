@@ -89,15 +89,28 @@ static func remove(client: McpClient, server_name: String) -> Dictionary:
 
 
 ## Build the entry dict written under mcp_servers[server_name].
-## Hermes HTTP entries are transport-inferred: just { url: <url> }. We do NOT
-## preserve stale keys from a prior entry (e.g. a `command: uvx mcp-proxy`
-## stdio-bridge form) — Hermes would then have both a url and a command and
-## pick the wrong transport. A clean { url: ... } is the correct, documented
-## Hermes shape. No `type` field.
-static func build_entry(client: McpClient, server_url: String, _existing: Variant = null) -> Dictionary:
+## Hermes HTTP entries are transport-inferred — { url: <url> } plus whatever
+## user-mutable keys (headers, enabled, tools, ...) the existing entry
+## carries. Stdio-bridge keys are the one exception (see _STDIO_BRIDGE_KEYS).
+## No `type` field.
+static func build_entry(client: McpClient, server_url: String, existing: Variant = null) -> Dictionary:
 	var entry: Dictionary = {}
+	if existing is Dictionary:
+		## User-mutable keys (headers, enabled, tools, ...) survive a
+		## reconfigure — the same preservation contract the JSON strategy's
+		## entry_initial_fields split implements. Only the stdio-bridge keys
+		## are scrubbed (see _STDIO_BRIDGE_KEYS), then the url is repointed.
+		entry = (existing as Dictionary).duplicate(true)
+		for stale_key in _STDIO_BRIDGE_KEYS:
+			entry.erase(stale_key)
 	entry[client.entry_url_field] = server_url
 	return entry
+
+
+## Keys a prior stdio-bridge entry (e.g. `command: uvx mcp-proxy`) may carry.
+## These must NOT survive a reconfigure: a Hermes entry with both a url and a
+## command picks the wrong transport.
+const _STDIO_BRIDGE_KEYS := ["command", "args", "env"]
 
 
 ## Verify a stored entry matches. Hermes entries have no transport type pin,
@@ -147,6 +160,16 @@ static func _extract_block(text: String) -> Dictionary:
 		probe += 1
 	if probe < lines.size():
 		entry_indent = _indent_of(lines[probe])
+
+	# Empty block guard: the first nonblank line after the header must sit
+	# DEEPER than the header itself to be an entry. At or above the header's
+	# indent it is a sibling/parent key — parsing it as an entry would
+	# swallow the user's next top-level key and re-emit it nested under
+	# mcp_servers, corrupting the file.
+	if probe < lines.size() and entry_indent <= _indent_of(lines[header_idx]):
+		for j in range(header_idx + 1, lines.size()):
+			suffix.append(lines[j])
+		return {"prefix_lines": prefix, "entries": entries, "suffix_lines": suffix, "header_idx": header_idx}
 
 	var i := header_idx + 1
 	while i < lines.size():
@@ -326,7 +349,7 @@ static func _read(path: String) -> Dictionary:
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null:
 		var err := FileAccess.get_open_error()
-		return {"ok": false, "error": "could not open for reading (error %d)" % err}
+		return {"ok": false, "error": "could not open for reading (%s)" % error_string(err)}
 	var t := f.get_as_text()
 	f.close()
 	return {"ok": true, "data": t}

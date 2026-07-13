@@ -2576,6 +2576,62 @@ func test_hermes_yaml_roundtrips_through_configure() -> void:
 	DirAccess.remove_absolute(path)
 
 
+func test_hermes_yaml_empty_block_does_not_swallow_sibling_key() -> void:
+	## Corruption regression: an EMPTY `mcp_servers:` block followed by a
+	## top-level sibling key. The block parser must not consume the sibling
+	## as a server entry — that would re-emit `model:` nested under
+	## mcp_servers on rewrite and corrupt the user's config.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var dir := OS.get_environment("TMPDIR")
+	if dir.is_empty():
+		dir = OS.get_environment("TEMP")
+	if dir.is_empty():
+		dir = "/tmp"
+	var path := dir.path_join("godot_ai_hermes_empty_block.yaml")
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "could not open temp yaml")
+	f.store_string("mcp_servers:\nmodel: openai/gpt-4o\n")
+	f.close()
+
+	var real_path := c.path_template
+	c.path_template = {"unix": path, "windows": path}
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	c.path_template = real_path
+	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
+
+	var reread := FileAccess.get_file_as_string(path)
+	assert_contains(reread, "godot-ai:")
+	# model must survive AT TOP LEVEL — never indented under mcp_servers.
+	var has_top_level_model := false
+	for line in reread.split("\n"):
+		if String(line).begins_with("model: openai/gpt-4o"):
+			has_top_level_model = true
+			break
+	assert_true(has_top_level_model, "sibling key must stay top-level, got:\n%s" % reread)
+	assert_false(reread.contains("  model:"), "sibling key must not be nested under mcp_servers, got:\n%s" % reread)
+	DirAccess.remove_absolute(path)
+
+
+func test_hermes_yaml_reconfigure_preserves_user_headers_drops_stdio_keys() -> void:
+	## Reconfigure preservation contract (mirrors JSON's entry_initial_fields
+	## split): user-mutable keys like `headers` survive a repoint; stale
+	## stdio-bridge keys (`command`) are scrubbed so Hermes never sees both a
+	## url and a command on one entry.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var existing := {
+		"url": "http://old:1234/mcp",
+		"command": "uvx mcp-proxy",
+		"headers": {"Authorization": "Bearer abc"},
+	}
+	var entry := McpYamlStrategy.build_entry(c, "http://127.0.0.1:8000/mcp", existing)
+	assert_eq(entry.get("url", ""), "http://127.0.0.1:8000/mcp", "url must be repointed")
+	assert_false(entry.has("command"), "stdio-bridge command must be scrubbed")
+	var headers: Dictionary = entry.get("headers", {})
+	assert_eq(headers.get("Authorization", ""), "Bearer abc", "user headers must survive reconfigure")
+
+
 func test_opencode_client_uses_home_config_on_windows() -> void:
 	## Regression: OpenCode reads its MCP config from
 	## ~/.config/opencode/opencode.json on ALL platforms (verified via

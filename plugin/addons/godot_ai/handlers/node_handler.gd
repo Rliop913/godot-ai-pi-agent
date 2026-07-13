@@ -993,7 +993,9 @@ func get_node_properties(params: Dictionary) -> Dictionary:
 	if not (fields_param is Array):
 		return ErrorCodes.make(
 			ErrorCodes.INVALID_PARAMS,
-			"'fields' must be an array of property names, got %s" % type_string(typeof(fields_param)),
+			"'fields' must be an array of property names, got %s (%s)" % [
+				type_string(typeof(fields_param)), str(fields_param),
+			],
 		)
 	var field_filter := {}
 	for f in fields_param:
