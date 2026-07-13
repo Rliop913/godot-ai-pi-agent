@@ -403,9 +403,16 @@ func _on_download_completed(
 
 ## Gate the extract on a SHA-256 match against the release's checksum sidecar.
 ## TLS + host pinning already constrain where the bytes came from; this
-## verifies the bytes themselves so a tampered asset (or a compromised CDN
-## object) can't be installed over live plugin code. Verification is
-## MANDATORY (#599): a release published without a `.sha256` sidecar —
+## verifies the bytes themselves, guarding against in-transit corruption and
+## single-object substitution (a tampered CDN edge, a partial/garbled
+## download). It is NOT protection against a compromised release: both
+## `download_url` and `checksum_url` come from the same GitHub Releases API
+## response over the same channel (`parse_releases_response`), so anyone able
+## to modify the release's assets (leaked repo token, compromised release
+## workflow) can regenerate the sidecar to match a tampered zip (#687
+## follow-up: signing the sidecar with a key outside the release workflow's
+## default token scope closes this gap; not yet implemented). Verification
+## is MANDATORY (#599): a release published without a `.sha256` sidecar —
 ## mistake or tamper — refuses to install rather than silently downgrading
 ## to an unverified install. This is safe because self-update only ever
 ## verifies the *next* download, and every release since #523 publishes the

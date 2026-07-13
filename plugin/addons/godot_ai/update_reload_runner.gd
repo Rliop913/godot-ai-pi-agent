@@ -374,13 +374,24 @@ func _install_zip_file(
 			FileAccess.get_open_error(),
 		])
 		return {}
-	f.store_buffer(content)
+	## `store_buffer` reports a short write only via its return value — it
+	## does NOT set the last-error state `get_error()` reads — and the write
+	## is stdio-buffered, so disk-full surfaces at flush/close, not here.
+	## Capture the return and re-verify the on-disk size after close() so a
+	## disk-full "succeeds" write can't rename a truncated file over the
+	## live target (#687).
+	var stored := f.store_buffer(content)
+	f.flush()
 	var write_error := f.get_error()
 	f.close()
-	if write_error != OK:
-		print("MCP | update extract failed: write error %d for %s" % [
+	var written_size := FileAccess.get_file_as_bytes(temp_path).size() if FileAccess.file_exists(temp_path) else -1
+	if not stored or write_error != OK or written_size != content.size():
+		print("MCP | update extract failed: write error %d for %s (stored=%s size=%d expected=%d)" % [
 			write_error,
 			temp_path,
+			stored,
+			written_size,
+			content.size(),
 		])
 		DirAccess.remove_absolute(temp_path)
 		return {}

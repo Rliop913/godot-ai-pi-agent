@@ -1520,6 +1520,33 @@ func test_atomic_write_cleans_up_tmp_on_success() -> void:
 	)
 
 
+func test_atomic_write_written_size_matches_detects_match() -> void:
+	## Direct unit test of the primitive the rename-commit gate (#687) relies
+	## on: an intact write must report a match.
+	var path := _scratch_dir.path_join("size_match_ok.txt")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string("hello world")
+	f.close()
+	assert_true(McpAtomicWrite._written_size_matches(path, "hello world"))
+
+
+func test_atomic_write_written_size_matches_detects_truncation() -> void:
+	## Simulates the disk-full failure mode #687 guards against: the on-disk
+	## file is shorter than what was supposed to be written (a truncated
+	## store_string). `_written_size_matches` must catch the mismatch so the
+	## rename-commit gate added to `write()` can refuse to commit it.
+	var path := _scratch_dir.path_join("size_match_truncated.txt")
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string("hello")  # on-disk bytes shorter than the intended content
+	f.close()
+	assert_false(McpAtomicWrite._written_size_matches(path, "hello world"))
+
+
+func test_atomic_write_written_size_matches_missing_file() -> void:
+	var missing := _scratch_dir.path_join("does_not_exist.txt")
+	assert_false(McpAtomicWrite._written_size_matches(missing, "anything"))
+
+
 func test_atomic_write_preserves_destination_when_swap_fails() -> void:
 	## Direct simulation of a Windows AV / lock failure is not portable, but
 	## the on-disk invariant for #297 finding #10 is testable: when the
