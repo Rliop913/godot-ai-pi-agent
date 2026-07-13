@@ -39,6 +39,10 @@ const FIRST_FRAME_WAIT_SEC := 6.0
 
 const GameLogger := preload("res://addons/godot_ai/runtime/game_logger.gd")
 const ErrorCodes := preload("res://addons/godot_ai/utils/error_codes.gd")
+## Shared with the editor-side copy in editor_handler.gd (#716). Preload by
+## path, not class_name: this autoload runs in the game process and must not
+## depend on the editor's global-class cache being warm.
+const ScreenshotEncode := preload("res://addons/godot_ai/utils/screenshot_encode.gd")
 
 var _registered := false
 ## Captures game-process print, warning, and error output for the editor.
@@ -176,27 +180,15 @@ func _handle_take_screenshot(data: Array) -> void:
 		_reply_error(request_id, "Captured an empty image from game viewport")
 		return
 
-	var original_width := image.get_width()
-	var original_height := image.get_height()
-
-	if max_resolution > 0:
-		var longest := maxi(original_width, original_height)
-		if longest > max_resolution:
-			var scale := float(max_resolution) / float(longest)
-			var new_w := maxi(1, int(original_width * scale))
-			var new_h := maxi(1, int(original_height * scale))
-			image.resize(new_w, new_h, Image.INTERPOLATE_LANCZOS)
-
-	var png := image.save_png_to_buffer()
-	var b64 := Marshalls.raw_to_base64(png)
+	var encoded: Dictionary = ScreenshotEncode.downscale_and_encode(image, max_resolution)
 
 	EngineDebugger.send_message("mcp:screenshot_response", [
 		request_id,
-		b64,
-		image.get_width(),
-		image.get_height(),
-		original_width,
-		original_height,
+		encoded.base64,
+		encoded.width,
+		encoded.height,
+		encoded.original_width,
+		encoded.original_height,
 	])
 
 

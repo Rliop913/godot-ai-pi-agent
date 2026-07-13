@@ -13,6 +13,7 @@ from godot_ai.godot_client.client import GodotClient, GodotCommandError
 from godot_ai.handlers import editor as editor_handlers
 from godot_ai.handlers import scene as scene_handlers
 from godot_ai.runtime.direct import DirectRuntime
+from tests.conftest import drain_handshake_ack
 
 # ---------------------------------------------------------------------------
 # Handshake
@@ -1078,10 +1079,8 @@ class TestDnsRebindingGuard:
         await ws.send(json.dumps(handshake))
         await asyncio.sleep(0.05)
         ## Drain the ack so it doesn't pollute later asserts.
-        try:
-            await asyncio.wait_for(ws.recv(), timeout=0.5)
-        except asyncio.TimeoutError:
-            pass
+        ## Mandatory (#716) — see conftest's drain_handshake_ack.
+        await drain_handshake_ack(ws)
         assert harness.registry.get("origin-loopback") is not None
         await ws.close()
 
@@ -1127,10 +1126,8 @@ class TestDnsRebindingGuard:
         }
         await ws.send(json.dumps(handshake))
         await asyncio.sleep(0.05)
-        try:
-            await asyncio.wait_for(ws.recv(), timeout=0.5)
-        except asyncio.TimeoutError:
-            pass
+        ## Mandatory ack drain (#716) — see conftest's drain_handshake_ack.
+        await drain_handshake_ack(ws)
         assert harness.registry.get("ipv6-loopback") is not None
         await ws.close()
 

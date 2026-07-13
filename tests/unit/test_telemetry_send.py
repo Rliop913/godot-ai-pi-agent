@@ -242,10 +242,20 @@ class TestConvenienceHelpers:
 
     def test_record_failure_minimal(self, clean_env, isolated_data_dir) -> None:
         _, sent = self._captured(isolated_data_dir)
-        tel.record_failure("scene_save", "disk full")
+        tel.record_failure("scene_save", "disk_full")
         self._wait(sent)
         assert sent[0].record_type is tel.RecordType.FAILURE
-        assert sent[0].data == {"component": "scene_save", "error": "disk full"}
+        assert sent[0].data == {"component": "scene_save", "error": "disk_full"}
+
+    def test_record_failure_mangles_non_token_characters(
+        self, clean_env, isolated_data_dir
+    ) -> None:
+        _, sent = self._captured(isolated_data_dir)
+        ## A path or pasted exception must not survive intact: everything
+        ## outside [A-Za-z0-9_.-] — including "/" — becomes "_" (#716).
+        tel.record_failure("scene_save", "open /home/alice/secret.tscn: denied")
+        self._wait(sent)
+        assert sent[0].data["error"] == "open__home_alice_secret.tscn__denied"
 
     def test_record_failure_with_metadata_and_truncation(
         self, clean_env, isolated_data_dir
@@ -254,7 +264,9 @@ class TestConvenienceHelpers:
         long = "x" * 1000
         tel.record_failure("scene_save", long, {"path": "res://x.tscn"})
         self._wait(sent)
-        assert len(sent[0].data["error"]) == 500
+        ## 64, not 500 (#716): the param is a short category token; anything
+        ## longer (a pasted exception string) is deliberately mangled.
+        assert len(sent[0].data["error"]) == 64
         assert sent[0].data["path"] == "res://x.tscn"
 
     def test_record_tool_usage_no_sub_action_no_error(self, clean_env, isolated_data_dir) -> None:

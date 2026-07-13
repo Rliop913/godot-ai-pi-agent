@@ -305,10 +305,30 @@ class TestTelemetryCollector:
 
         assert collector.record_milestone(tel.MilestoneType.FIRST_STARTUP) is True
         assert collector.record_milestone(tel.MilestoneType.FIRST_STARTUP) is False
+        ## Persistence now happens on the worker thread (#716) — join the
+        ## queue so the file is flushed before reading it back.
+        collector._queue.join()
         ## On-disk milestones file must reflect exactly one entry.
         on_disk = json.loads(collector.config.milestones_file.read_text(encoding="utf-8"))
         assert "first_startup" in on_disk
         collector.shutdown()
+
+    def test_milestone_survives_full_queue(self, clean_env, isolated_data_dir) -> None:
+        """The #716 persist-on-worker change must not lose the milestone
+        itself when the queue is saturated: the in-memory record (and
+        therefore idempotence) still lands; only the disk flush is deferred
+        to a later persist request.
+        """
+        collector = tel.TelemetryCollector()
+        ## Stop the worker and saturate the queue so put_nowait raises Full.
+        collector._shutdown = True
+        collector._worker.join(timeout=1.0)
+        for _ in range(collector.QUEUE_MAXSIZE):
+            collector.record(tel.RecordType.USAGE, {"x": 1})
+
+        assert collector.record_milestone(tel.MilestoneType.FIRST_STARTUP) is True
+        ## In-memory registration is intact — a repeat is still deduped.
+        assert collector.record_milestone(tel.MilestoneType.FIRST_STARTUP) is False
 
     def test_customer_uuid_round_trip(self, clean_env, isolated_data_dir) -> None:
         c1 = tel.TelemetryCollector()

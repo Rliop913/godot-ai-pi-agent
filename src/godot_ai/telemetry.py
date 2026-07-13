@@ -33,6 +33,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import sys
 import threading
 import time
@@ -50,6 +51,10 @@ from godot_ai import __version__ as _PACKAGE_VERSION
 from godot_ai.protocol.errors import EditorNotReadySubCode, ErrorCode
 
 logger = logging.getLogger("godot-ai-telemetry")
+
+## Worker-queue sentinel: flush the milestones file from the worker thread
+## instead of the caller's (event-loop) thread — see record_milestone (#716).
+_PERSIST_MILESTONES = object()
 
 ## Public surface: anything importable from this module that callers may
 ## reach for. Kept small on purpose — we want a single choke point.
@@ -417,11 +422,20 @@ class TelemetryCollector:
         if not self.config.enabled:
             return False
         key = milestone.value
+        ## Mark in memory under the lock; persistence is enqueued for the
+        ## worker thread (#716) — this runs on the asyncio event loop, and a
+        ## synchronous write_text here contradicted the module's "telemetry
+        ## never blocks the caller" contract. Best-effort: a dropped persist
+        ## (full queue) means the milestone may re-fire after a restart —
+        ## the same failure mode the old OSError swallow already had.
         with self._lock:
             if key in self._milestones:
                 return False
             self._milestones[key] = {"timestamp": time.time(), "data": data or {}}
-            self._save_milestones()
+        try:
+            self._queue.put_nowait(_PERSIST_MILESTONES)
+        except queue.Full:
+            logger.debug("Telemetry queue full; milestone %s persisted in memory only", key)
 
         self.record(
             RecordType.USAGE,
@@ -466,7 +480,11 @@ class TelemetryCollector:
             except queue.Empty:
                 continue
             try:
-                self._send(rec)
+                if rec is _PERSIST_MILESTONES:
+                    with self._lock:
+                        self._save_milestones()
+                else:
+                    self._send(rec)
             except Exception:  # noqa: BLE001  ## telemetry must never raise out
                 logger.debug("Telemetry send failed", exc_info=True)
             finally:
@@ -647,12 +665,23 @@ def record_latency(
 
 def record_failure(
     component: str,
-    error: str,
+    error_category: str,
     metadata: dict[str, Any] | None = None,
 ) -> None:
+    """Record a component failure under a short CATEGORY token.
+
+    ``error_category`` is a category ("disk_full", "timeout"), not free-form
+    error text — the payload ships to shared telemetry, and raw exception
+    strings can embed user paths / project names. Characters outside the
+    token alphabet ([A-Za-z0-9_.-]) are replaced with "_" and the result is
+    truncated to 64 chars (the sub_code convention), so a pasted exception
+    or path arrives obviously mangled rather than silently exfiltrated
+    (#716 audit note). Note "/" is NOT in the alphabet: path separators are
+    the clearest leak signal, so they get mangled too.
+    """
     data: dict[str, Any] = {
         "component": component,
-        "error": _truncate(error, 500),
+        "error": _truncate(re.sub(r"[^A-Za-z0-9_.-]", "_", error_category), 64),
     }
     if metadata:
         data.update(metadata)
