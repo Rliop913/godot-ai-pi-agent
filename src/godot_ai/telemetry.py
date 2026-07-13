@@ -11,9 +11,11 @@ and simplified:
 * Session-id slugs are hashed before leaving the process (privacy: project
   directory names can be identifying — only the 4-hex twin suffix is sent
   verbatim).
-* Endpoint is opt-in via ``GODOT_AI_TELEMETRY_ENDPOINT``. Empty default
-  means: collector still runs and persists ``customer_uuid``, but nothing
-  goes over the wire. Zero stray traffic before a backend is connected.
+* Endpoint resolves env override -> baked-in production default
+  (``GODOT_AI_TELEMETRY_ENDPOINT`` -> ``DEFAULT_ENDPOINT``), so telemetry
+  sends by default; the opt-out env vars are the only way to stop sends.
+  An *invalid* override resolves to empty (send-skipped) rather than
+  falling back, so a misconfigured self-host can't leak to production.
 
 Fire-and-forget: a single background daemon thread drains a bounded
 ``queue.Queue`` and POSTs records. Telemetry never blocks the caller and
@@ -194,8 +196,6 @@ class TelemetryConfig:
             self.milestones_file = self.data_dir / "milestones.json"
         else:
             self._cleanup_local_files()
-
-        self.session_id = str(uuid.uuid4())
 
     # --- env helpers -----------------------------------------------------
 

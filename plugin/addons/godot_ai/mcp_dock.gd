@@ -2072,10 +2072,13 @@ func _build_tools_tab(tabs: TabContainer) -> void:
 	core_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	core_row.add_child(core_label)
 	var core_count := Label.new()
-	core_count.text = "%d tools" % ToolCatalog.CORE_TOOLS.size()
+	core_count.text = "%d tools" % (ToolCatalog.CORE_TOOLS.size() + ToolCatalog.ALWAYS_ON_TOOLS.size())
 	core_count.add_theme_color_override("font_color", COLOR_MUTED)
 	core_row.add_child(core_count)
-	core_row.tooltip_text = ", ".join(ToolCatalog.CORE_TOOLS)
+	core_row.tooltip_text = "%s · always on: %s" % [
+		", ".join(ToolCatalog.CORE_TOOLS),
+		", ".join(ToolCatalog.ALWAYS_ON_TOOLS),
+	]
 	grid.add_child(core_row)
 
 	grid.add_child(HSeparator.new())
@@ -2168,8 +2171,11 @@ func _build_tools_domain_row(parent: VBoxContainer, entry: Dictionary) -> void:
 func _reset_tools_pending_from_setting() -> void:
 	## Read the saved setting → pending/saved arrays, then sync checkbox state.
 	## Unknown domain names in the setting (e.g. from an older plugin
-	## version) are silently dropped — matches the Python side's
-	## warn-and-continue behavior when it sees an unknown name.
+	## version) are dropped from the display here (only ids with a checkbox
+	## survive). The startup path is protected separately:
+	## `ClientConfigurator.excluded_domains()` filters unknown names before
+	## they reach `--exclude-domains`, whose `parse_exclude_list` hard-fails
+	## on them.
 	var saved_raw := ClientConfigurator.excluded_domains()
 	var saved := PackedStringArray()
 	if not saved_raw.is_empty():
