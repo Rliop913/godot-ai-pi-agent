@@ -54,8 +54,15 @@ async def node_find(
     return paginate(result.get("nodes", []), offset, limit, key="nodes")
 
 
-async def node_get_properties(runtime: DirectRuntime, path: str) -> dict:
-    return await runtime.send_command("get_node_properties", {"path": path})
+async def node_get_properties(
+    runtime: DirectRuntime,
+    path: str,
+    fields: list[str] | None = None,
+) -> dict:
+    params: dict = {"path": path}
+    if fields:
+        params["fields"] = fields
+    return await runtime.send_command("get_node_properties", params)
 
 
 async def node_get_children(runtime: DirectRuntime, path: str) -> dict:
