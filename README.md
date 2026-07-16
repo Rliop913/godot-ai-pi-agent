@@ -31,7 +31,11 @@
 ### Prerequisites
 
 - Godot `4.5+` (`4.7+` recommended)
-- [uv](https://docs.astral.sh/uv/) (for the Python server):
+- [uv](https://docs.astral.sh/uv/) (for the Python server)
+
+  <details>
+  <summary>How to install uv (macOS / Linux / Windows / package managers)</summary>
+
   - **macOS / Linux:** `curl -LsSf https://astral.sh/uv/install.sh | sh`
   - **Windows (PowerShell):** `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
   - **Prefer your package manager?** `uv` is a popular open-source tool packaged in
@@ -41,6 +45,8 @@
     - **Fedora:** `sudo dnf install uv`
     - **macOS (Homebrew):** `brew install uv`
   - Other options: [uv install docs](https://docs.astral.sh/uv/getting-started/installation/)
+
+  </details>
 - An MCP client ([Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [Codex](https://openai.com/index/codex/) | [Antigravity](https://www.antigravity.dev/))
 
 ### 1. Install the plugin
@@ -281,8 +287,12 @@ Full details (what's collected, where data lives, how to self-host the endpoint)
 
 ## Star History
 
-<a href="https://star-history.com/#hi-godot/godot-ai&Date">
-  <img src="https://api.star-history.com/svg?repos=hi-godot/godot-ai&type=Date" alt="Star History Chart" width="700">
+<!-- Regenerated weekly by .github/workflows/star-history.yml (#750):
+     GitHub restricted stargazer history to repo collaborators, which broke
+     star-history.com's unauthenticated embed, so the chart is now rendered
+     in CI and committed here. -->
+<a href="https://github.com/hi-godot/godot-ai/stargazers">
+  <img src="docs/images/star-history.svg" alt="Star History Chart" width="700">
 </a>
 
 ---
