@@ -35,6 +35,14 @@ var _server_state: int = McpServerStateScript.UNINITIALIZED
 
 ## OS-level state populated only when WE spawned the process.
 var _server_pid: int = -1
+## keep_server_on_exit (#800): whether the RUNNING server was launched with
+## the keep-alive env opt-outs (no owner pid, NO_IDLE_EXIT staged). Editor
+## teardown routes on this, never on the live setting — a server spawned
+## without the opt-outs must die with the editor even if the user enabled
+## the setting mid-session, or the owner-PID watchdog reaps it seconds
+## later and the preserved record goes stale (the #774 scenario). Set at
+## spawn, recovered from the managed-server record on adoption.
+var _server_keep_alive := false
 var _server_spawn_ms: int = 0
 var _server_exit_ms: int = 0
 
@@ -199,6 +207,7 @@ func get_status_dict() -> Dictionary:
 		"can_recover_incompatible": _can_recover_incompatible,
 		"connection_blocked": _connection_blocked,
 		"conflict_port": _conflict_port,
+		"keep_alive": _server_keep_alive,
 	}
 
 
@@ -559,6 +568,10 @@ func _inject_telemetry_env() -> bool:
 func _set_owner_pid_env() -> bool:
 	if OS.get_name() == "Windows":
 		return false
+	## keep_server_on_exit (#800): a server meant to outlive editors must not
+	## self-reap when this editor dies — don't hand it an owner pid at all.
+	if ClientConfigurator.keep_server_on_exit():
+		return false
 	OS.set_environment("GODOT_AI_OWNER_PID", str(OS.get_process_id()))
 	return true
 
@@ -574,6 +587,20 @@ func _set_owner_pid_env() -> bool:
 ## itself.
 func _set_plugin_spawned_env() -> void:
 	OS.set_environment("GODOT_AI_PLUGIN_SPAWNED", "1")
+
+
+## keep_server_on_exit (#800): opt the spawned server out of the
+## session-idle self-terminate backstop (#498) via its existing
+## GODOT_AI_NO_IDLE_EXIT escape hatch — a keep-alive server sits at zero
+## sessions between editor runs by design, which is exactly what the
+## backstop reaps. Returns true if set (same tight scoping as
+## _set_owner_pid_env: callers unset right after spawning, and only when
+## WE set it, so a user's own NO_IDLE_EXIT env is never stripped).
+func _set_keep_alive_env() -> bool:
+	if not ClientConfigurator.keep_server_on_exit():
+		return false
+	OS.set_environment("GODOT_AI_NO_IDLE_EXIT", "1")
+	return true
 
 
 ## Generate a fresh per-launch WS handshake auth token (#690) and stage it
@@ -866,6 +893,7 @@ func _start_server_impl(async_gen: int) -> void:
 	## gates on this too.
 	var owner_env_set := _set_owner_pid_env()
 	_set_plugin_spawned_env()
+	var keep_alive_env_set := _set_keep_alive_env()
 	var ws_token := _set_ws_token_env()
 
 	_server_pid = OS.create_process(cmd, args)
@@ -874,6 +902,8 @@ func _start_server_impl(async_gen: int) -> void:
 	if owner_env_set:
 		OS.unset_environment("GODOT_AI_OWNER_PID")
 	OS.unset_environment("GODOT_AI_PLUGIN_SPAWNED")
+	if keep_alive_env_set:
+		OS.unset_environment("GODOT_AI_NO_IDLE_EXIT")
 	OS.unset_environment("GODOT_AI_WS_TOKEN")
 
 	## Restore PYTHONPATH immediately — the spawned child has already
@@ -892,6 +922,7 @@ func _start_server_impl(async_gen: int) -> void:
 	if spawned_pid > 0:
 		_server_spawn_ms = Time.get_ticks_msec()
 		_server_exit_ms = 0
+		_server_keep_alive = keep_alive_env_set
 		_host._server_started_this_session = true
 		transition_state(McpServerStateScript.SPAWNING)
 		## The child copied the env, so this token is what the server will
@@ -901,7 +932,7 @@ func _start_server_impl(async_gen: int) -> void:
 		## Record the launcher PID so same-session
 		## prepare_for_update_reload has something to kill. The next
 		## editor start's adopt branch heals it to the real port owner.
-		_host._write_managed_server_record(spawned_pid, current_version)
+		_host._write_managed_server_record(spawned_pid, current_version, _server_keep_alive)
 		_startup_path = McpStartupPathScript.SPAWNED
 		## Log "PYTHONPATH prefix=" rather than "PYTHONPATH=" so the line
 		## isn't misleading when an existing PYTHONPATH was present —
@@ -933,7 +964,7 @@ func check_server_health() -> void:
 		## teardown can kill it. Heal it as soon as the server publishes its
 		## authoritative PID; future adoption requires the recorded PID to be
 		## the actual live listener (#759).
-		_host._write_managed_server_record(real_pid, _expected_server_version())
+		_host._write_managed_server_record(real_pid, _expected_server_version(), _server_keep_alive)
 	elif not PortResolver.pid_alive(spawn_pid):
 		if elapsed >= int(_host.SPAWN_GRACE_MS) and not McpServerStateScript.is_terminal_diagnosis(_server_state):
 			_diagnose_spawn_fast_exit(elapsed)
@@ -1060,11 +1091,14 @@ func respawn_with_refresh() -> void:
 	## start_server) — and unset right after, same scoping as start_server.
 	var owner_env_set := _set_owner_pid_env()
 	_set_plugin_spawned_env()
+	var keep_alive_env_set := _set_keep_alive_env()
 	var ws_token := _set_ws_token_env()
 	_server_pid = OS.create_process(cmd, args)
 	if owner_env_set:
 		OS.unset_environment("GODOT_AI_OWNER_PID")
 	OS.unset_environment("GODOT_AI_PLUGIN_SPAWNED")
+	if keep_alive_env_set:
+		OS.unset_environment("GODOT_AI_NO_IDLE_EXIT")
 	OS.unset_environment("GODOT_AI_WS_TOKEN")
 	if injected_telemetry_env:
 		OS.unset_environment("GODOT_AI_DISABLE_TELEMETRY")
@@ -1072,9 +1106,10 @@ func respawn_with_refresh() -> void:
 	if spawn_pid > 0:
 		_server_spawn_ms = Time.get_ticks_msec()
 		_server_exit_ms = 0
+		_server_keep_alive = keep_alive_env_set
 		var current_version := _expected_server_version()
 		_host._set_ws_auth_token(ws_token)
-		_host._write_managed_server_record(spawn_pid, current_version)
+		_host._write_managed_server_record(spawn_pid, current_version, _server_keep_alive)
 		print("MCP | retried server (PID %d, v%s): %s %s" % [spawn_pid, current_version, cmd, " ".join(args)])
 	else:
 		## OS.create_process returned -1 on the retry — surface CRASHED
@@ -1101,9 +1136,15 @@ func adopt_compatible_server(
 		## equality alone is deliberately insufficient: the record must also
 		## identify the live branded listener (#759/#764).
 		_server_pid = owner
-		_host._write_managed_server_record(owner, current_version)
+		## Recover the keep-alive launch flag from the record the spawning
+		## session persisted — a keep-alive survivor adopted here must
+		## detach again on THIS session's exit, and only the record knows
+		## how the process was actually launched.
+		_server_keep_alive = bool(_host._read_managed_server_record().get("keep_alive", false))
+		_host._write_managed_server_record(owner, current_version, _server_keep_alive)
 		return McpAdoptionLabelScript.MANAGED
 	_server_pid = -1
+	_server_keep_alive = false
 	## External server: we didn't spawn it and don't know its token (it
 	## most likely has none — dev servers aren't launched with one). Drop
 	## ours so the handshake omits the field instead of sending a stale
@@ -1186,6 +1227,36 @@ func recover_strong_port_occupant(port: int, wait_s: float, pre_kill_live: Dicti
 	return true
 
 
+## Editor-exit teardown chooser (#800): detach only when the RUNNING
+## server was launched keep-alive (_server_keep_alive, set at spawn /
+## recovered on adoption) — never on the live setting, which may have
+## been toggled after spawn. Flag clear → stop_server kills as always,
+## so enabling the setting mid-session takes effect on the next server
+## start instead of leaving a record that points at a soon-reaped PID.
+func teardown_for_editor_exit() -> void:
+	if _server_keep_alive:
+		detach_server()
+	else:
+		stop_server()
+
+
+## keep_server_on_exit (#800): editor teardown that leaves the server
+## running. Mirrors stop_server's bookkeeping — cancel in-flight async
+## startup, stop the watch, settle on STOPPED — but kills nothing and
+## PRESERVES the managed-server record + pid-file, so the next editor
+## session's start_server walk adopts the survivor through the existing
+## record-matches branch (#758/#774). Explicit stops (dock Restart,
+## update reload) still route through stop_server and kill as before.
+func detach_server() -> void:
+	_invalidate_async_startup()
+	_host._stop_server_watch()
+	var detached_pid := int(_server_pid)
+	_server_pid = -1
+	transition_state(McpServerStateScript.STOPPED)
+	if detached_pid > 0:
+		print("MCP | keep_server_on_exit: leaving server running (PID %d)" % detached_pid)
+
+
 func stop_server() -> void:
 	## Cancel any in-flight async startup (#678): a suspended start_server
 	## resuming after teardown must not resurrect state or spawn a server.
@@ -1232,6 +1303,7 @@ func stop_server() -> void:
 	if not killed.is_empty():
 		print("MCP | stopped server (PID %s)" % str(killed))
 	_server_pid = -1
+	_server_keep_alive = false
 	_host._wait_for_port_free(port, 2.0)
 	## Preserve record/pid-file when port is still held — the drift
 	## branch on the next start_server retries the kill (#159 follow-up).
