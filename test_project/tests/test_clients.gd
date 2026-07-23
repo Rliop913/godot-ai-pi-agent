@@ -171,10 +171,55 @@ func test_config_path_facade_handles_unknown_and_file_clients() -> void:
 
 
 func test_config_path_facade_returns_empty_for_pure_cli_client() -> void:
+	## Decoupled from any specific registered client (#kimi-mcp-json): a "pure
+	## CLI" client is any descriptor with config_type "cli" and no JSON
+	## fallback (empty path_template / server_key_path). kimi_code used to be
+	## the only example in the registry until it moved to config_type "json"
+	## — see test_kimi_code_client_json_descriptor.
+	##
+	## config_path() resolves through ClientRegistry.get_by_id(id), so an
+	## unregistered synthetic McpClient never reaches its descriptor logic at
+	## all — it would just retrace the unknown-id path already covered by
+	## test_config_path_facade_handles_unknown_and_file_clients. Discover a
+	## real registered pure-CLI client instead, and skip with a clear reason
+	## if none currently exists.
+	var pure_cli_id := ""
+	for id in McpClientConfigurator.client_ids():
+		var client := McpClientRegistry.get_by_id(String(id))
+		if client != null and client.config_type == "cli" and not client.has_json_fallback():
+			pure_cli_id = String(id)
+			break
+	if pure_cli_id.is_empty():
+		skip("No registered pure CLI client (config_type \"cli\" with no JSON fallback) is available")
+		return
+	assert_eq(McpClientConfigurator.config_path(pure_cli_id), "")
+
+
+func test_kimi_code_client_json_descriptor() -> void:
+	## Regression guard: Kimi Code has no `mcp` CLI subcommand (verified
+	## against v0.28.1 — `kimi mcp` falls through to the root --help). Servers
+	## are managed via ~/.kimi-code/mcp.json instead (see
+	## moonshotai.github.io/kimi-code/en/customization/mcp). The previous
+	## descriptor ran `kimi mcp add --transport http ...`, which always failed
+	## with "error: unknown option '--transport'" since that verb doesn't
+	## exist. Pin the JSON shape so a future revert reintroduces the failure
+	## loudly here instead of silently at Configure time.
 	var client := McpClientRegistry.get_by_id("kimi_code")
-	assert_true(client != null, "kimi_code must remain registered as a pure CLI client")
-	assert_eq(client.config_type, "cli")
-	assert_eq(McpClientConfigurator.config_path("kimi_code"), "")
+	assert_true(client != null, "kimi_code must remain registered")
+	assert_eq(client.config_type, "json")
+	assert_eq(
+		String(client.path_template.get("unix", "")),
+		"~/.kimi-code/mcp.json",
+		"Kimi Code config path must be ~/.kimi-code/mcp.json"
+	)
+	assert_eq(
+		String(client.path_template.get("windows", "")),
+		"~/.kimi-code/mcp.json",
+		"Kimi Code config path must be ~/.kimi-code/mcp.json on Windows too"
+	)
+	assert_eq(client.server_key_path.size(), 1)
+	assert_eq(String(client.server_key_path[0]), "mcpServers")
+	assert_eq(client.entry_extra_fields.get("transport"), "http")
 
 
 func test_descriptors_are_data_only() -> void:
