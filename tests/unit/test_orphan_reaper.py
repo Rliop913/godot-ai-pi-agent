@@ -123,6 +123,27 @@ async def test_no_reap_when_owner_dead_but_adopted():
     assert calls == []
 
 
+async def test_owner_reaper_honors_live_lease_then_reaps_after_expiry():
+    calls: list[bool] = []
+    state = {"leases": 1}
+    task = asyncio.create_task(
+        watch_owner(
+            4242,
+            lambda: 0,
+            lease_count=lambda: state["leases"],
+            poll_seconds=0.005,
+            is_alive=lambda _pid: False,
+            shutdown=lambda: calls.append(True),
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert calls == []
+
+    state["leases"] = 0
+    await asyncio.wait_for(task, timeout=1)
+    assert calls == [True]
+
+
 async def test_reaps_once_adopter_disconnects():
     ## Sessions present for a few polls, then drop to zero with the owner dead.
     calls: list[bool] = []
