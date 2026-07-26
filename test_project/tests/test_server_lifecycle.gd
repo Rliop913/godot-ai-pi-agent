@@ -1177,3 +1177,292 @@ func test_first_death_stamp_takes_the_first_tick_that_saw_the_death() -> void:
 	## per spawn, so this is the fresh-spawn entry point.
 	assert_eq(McpServerLifecycleManagerScript.first_death_stamp(0, 5146), 5146,
 		"an unstamped watch must record the tick that first saw the spawn dead")
+
+
+# ----- #824: teardown honors active attach leases -----
+
+func test_teardown_detaches_when_attach_leases_are_active() -> void:
+	## The startup order the issue describes: editor spawns the backend, an MCP
+	## client's attach bridge adopts it and registers a lease, then the editor
+	## closes normally. Killing here would take the server out from under a live
+	## client, so the backend survives and the plugin drops its managed claim.
+	var es := EditorInterface.get_editor_settings()
+	var saved := _save_keep_setting(es)
+	es.set_setting(McpClientConfigurator.SETTING_KEEP_SERVER_ON_EXIT, false)
+	var host := _ManagerHostStub.new()
+	host.listener_pids = [63333] as Array[int]
+	host.alive_pids = [63333] as Array[int]
+	host.branded_pids = [63333] as Array[int]
+	host.live_status = {"name": "godot-ai", "active_lease_count": 1}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 63333
+
+	manager.teardown_for_editor_exit()
+	var killed := host.killed_targets.duplicate()
+	var cleared := host.cleared_record_calls
+	var pid_after := int(manager._server_pid)
+	_restore_keep_setting(es, saved)
+	host.free()
+
+	assert_true(killed.is_empty(),
+		"a backend with a live attach lease must survive normal editor exit")
+	assert_eq(cleared, 1,
+		"the plugin must drop its managed claim so the next editor adopts externally")
+	assert_eq(pid_after, -1, "the detached PID must not stay tracked as killable")
+
+
+func test_teardown_kills_when_no_leases_are_held() -> void:
+	## The no-lease case is the overwhelmingly common one and must not change:
+	## a backend nobody else is using still dies with the editor that spawned it.
+	var es := EditorInterface.get_editor_settings()
+	var saved := _save_keep_setting(es)
+	es.set_setting(McpClientConfigurator.SETTING_KEEP_SERVER_ON_EXIT, false)
+	var host := _ManagerHostStub.new()
+	host.listener_pids = [64444] as Array[int]
+	host.alive_pids = [64444] as Array[int]
+	host.branded_pids = [64444] as Array[int]
+	host.live_status = {"name": "godot-ai", "active_lease_count": 0}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 64444
+
+	manager.teardown_for_editor_exit()
+	var killed := host.killed_targets.duplicate()
+	_restore_keep_setting(es, saved)
+	host.free()
+
+	assert_true(killed.has(64444),
+		"a backend with no leases must still be stopped by the editor that spawned it")
+
+
+func test_lease_count_reads_zero_for_a_backend_too_old_to_publish_it() -> void:
+	## Staggered upgrade: plugin knows about leases, backend does not. Absent
+	## field must read as "no information", which keeps that pairing on the
+	## historical kill-on-exit behavior rather than stranding a process.
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count(
+		{"name": "godot-ai", "server_version": "3.0.7"}), 0)
+
+
+func test_lease_count_ignores_a_process_that_is_not_godot_ai() -> void:
+	## An unrelated process answering on the port must not be able to talk this
+	## editor out of a clean stop by claiming leases.
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count(
+		{"name": "something-else", "active_lease_count": 9}), 0)
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count({}), 0,
+		"a failed or timed-out probe returns {} and must read as no leases")
+
+
+func test_lease_count_clamps_a_nonsense_value() -> void:
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count(
+		{"name": "godot-ai", "active_lease_count": -3}), 0)
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count(
+		{"name": "godot-ai", "active_lease_count": 4}), 4)
+
+
+func test_lease_probe_skipped_when_no_managed_pid() -> void:
+	## Nothing to hand over and nothing to kill: teardown must not pay for an
+	## HTTP probe on the way out.
+	var host := _ManagerHostStub.new()
+	host.live_status = {"name": "godot-ai", "active_lease_count": 5}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 0
+
+	var count := manager.active_lease_count_at_exit()
+	var probes := host.probe_calls
+	host.free()
+
+	assert_eq(count, 0)
+	assert_eq(probes, 0, "no managed PID must mean no status probe at exit")
+
+
+func test_leases_ignored_when_the_managed_pid_cannot_be_proven_ours() -> void:
+	## #824 instance-binding: the lease count comes from whoever answers on the
+	## port, which is not proof that it is the process we are about to stop.
+	## Another backend holding the port must not talk this editor out of
+	## stopping its own server, so an unbranded PID falls back to stop_server
+	## (whose own #686 gate then declines to kill a PID it cannot verify).
+	var es := EditorInterface.get_editor_settings()
+	var saved := _save_keep_setting(es)
+	es.set_setting(McpClientConfigurator.SETTING_KEEP_SERVER_ON_EXIT, false)
+	var host := _ManagerHostStub.new()
+	host.alive_pids = [65555] as Array[int]
+	## Deliberately NOT branded: a recycled PID, or a stranger's process.
+	host.branded_pids = [] as Array[int]
+	host.live_status = {"name": "godot-ai", "active_lease_count": 3}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 65555
+
+	var count := manager.active_lease_count_at_exit()
+	var cleared := host.cleared_record_calls
+	var probes := host.probe_calls
+	_restore_keep_setting(es, saved)
+	host.free()
+
+	assert_eq(count, 0,
+		"leases must not be honored for a PID we cannot prove is our server")
+	assert_eq(probes, 0,
+		"the proof gate must short-circuit before paying for the status probe")
+	assert_eq(cleared, 0)
+
+
+func test_leases_honored_only_for_a_live_branded_managed_pid() -> void:
+	## The positive half of the same gate, so it cannot silently start
+	## returning 0 for everything.
+	var host := _ManagerHostStub.new()
+	host.alive_pids = [66666] as Array[int]
+	host.branded_pids = [66666] as Array[int]
+	host.live_status = {"name": "godot-ai", "active_lease_count": 2}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 66666
+
+	var count := manager.active_lease_count_at_exit()
+	host.free()
+
+	assert_eq(count, 2, "a proven-ours backend's leases must be honored")
+
+
+func test_lease_count_gate_is_a_threshold_not_an_equality() -> void:
+	## Multiple bridges: teardown must detach while ANY lease is held, not only
+	## when exactly one is. Releasing one of several must keep the backend up.
+	for held in [1, 2, 7]:
+		assert_true(McpServerLifecycleManagerScript.active_lease_count(
+			{"name": "godot-ai", "active_lease_count": held}) > 0,
+			"%d held lease(s) must still count as occupied" % held)
+	assert_false(McpServerLifecycleManagerScript.active_lease_count(
+		{"name": "godot-ai", "active_lease_count": 0}) > 0,
+		"only the last release may return the backend to kill-on-exit")
+
+
+func test_teardown_routes_to_detach_for_more_than_one_lease() -> void:
+	## Routing, not just the helper: the earlier case holds exactly one lease,
+	## so a regression narrowing the gate to `== 1` would still pass it. Several
+	## bridges must reach detach too. `finalize_calls` is the discriminator —
+	## stop_server ends in _finalize_stop_if_port_free, detach_server never
+	## touches it.
+	var es := EditorInterface.get_editor_settings()
+	var saved := _save_keep_setting(es)
+	es.set_setting(McpClientConfigurator.SETTING_KEEP_SERVER_ON_EXIT, false)
+	var host := _ManagerHostStub.new()
+	host.listener_pids = [67777] as Array[int]
+	host.alive_pids = [67777] as Array[int]
+	host.branded_pids = [67777] as Array[int]
+	host.live_status = {"name": "godot-ai", "active_lease_count": 3}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 67777
+
+	manager.teardown_for_editor_exit()
+	var killed := host.killed_targets.duplicate()
+	var finalize_calls := host.finalize_calls
+	var cleared := host.cleared_record_calls
+	_restore_keep_setting(es, saved)
+	host.free()
+
+	assert_true(killed.is_empty(), "three held leases must still detach, not kill")
+	assert_eq(finalize_calls, 0, "detach must not run the stop path's finalize")
+	assert_eq(cleared, 1, "detach drops the managed claim")
+
+
+func test_teardown_routes_to_stop_when_the_pid_cannot_be_proven() -> void:
+	## The proof gate's routing half: a backend reporting leases must NOT keep
+	## the editor from stopping when the PID we hold cannot be proven ours.
+	## Teardown has to reach the stop path, and must not clear the managed
+	## record on the way (stop_server preserves it when the port is still held,
+	## so the next start_server's drift branch can retry the kill).
+	var es := EditorInterface.get_editor_settings()
+	var saved := _save_keep_setting(es)
+	es.set_setting(McpClientConfigurator.SETTING_KEEP_SERVER_ON_EXIT, false)
+	var host := _ManagerHostStub.new()
+	host.alive_pids = [68888] as Array[int]
+	host.branded_pids = [] as Array[int]
+	host.live_status = {"name": "godot-ai", "active_lease_count": 4}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 68888
+
+	manager.teardown_for_editor_exit()
+	var killed := host.killed_targets.duplicate()
+	var finalize_calls := host.finalize_calls
+	var cleared := host.cleared_record_calls
+	_restore_keep_setting(es, saved)
+	host.free()
+
+	assert_eq(finalize_calls, 1,
+		"an unprovable PID must reach the stop path despite reported leases")
+	assert_eq(cleared, 0,
+		"the lease detach's record clear must not fire on the stop path")
+	assert_true(killed.is_empty(),
+		"stop_server's own proof gate still declines to kill an unbranded PID")
+
+
+# ----- #824 regression: the probe must PROJECT what teardown consumes -----
+
+func test_status_projection_carries_the_lease_count_to_the_consumer() -> void:
+	## The gap that shipped in #839 and was caught only by a Windows smoke:
+	## teardown read `active_lease_count` off the probe result while
+	## `_probe_live_server_status` never copied it out of the JSON, so the
+	## lease branch was unreachable on every platform. The stubbed teardown
+	## tests could not see it because they hand-built the probe's result dict.
+	##
+	## This drives a real `/godot-ai/status` body through the actual projection
+	## and into the actual consumer, so the two halves cannot drift again.
+	var server_payload := {
+		"name": "godot-ai",
+		"server_version": "3.0.7",
+		"ws_port": 9500,
+		"tool_surface": "rollup",
+		"exclude_domains": [],
+		"package_path": "/src/godot_ai",
+		"instance_id": "e43bd1d9d15c418784676f87055d50b8",
+		"owner_type": "plugin",
+		"attach_protocol_version": 1,
+		"tool_catalog_hash": "deadbeef",
+		"active_lease_count": 2,
+	}
+
+	var projected := GodotAiPlugin._project_status_payload(server_payload)
+
+	assert_true(projected.has("active_lease_count"),
+		"the probe must project the field teardown reads, not drop it")
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count(projected), 2,
+		"a real status body with held leases must reach the teardown consumer")
+	## The fields the projection already carried must survive the refactor.
+	assert_eq(projected.get("name"), "godot-ai")
+	assert_eq(projected.get("version"), "3.0.7")
+	assert_eq(projected.get("ws_port"), 9500)
+	assert_eq(projected.get("package_path"), "/src/godot_ai")
+	assert_true(bool(projected.get("reachable")))
+
+
+func test_status_projection_leaves_an_older_backends_field_absent() -> void:
+	## "Too old to publish it" must stay distinguishable from "reports zero",
+	## which is what the absent-stays-absent rule buys. Both stop the server.
+	var projected := GodotAiPlugin._project_status_payload({
+		"name": "godot-ai", "server_version": "3.0.6", "ws_port": 9500,
+	})
+	assert_false(projected.has("active_lease_count"),
+		"a backend that never published the field must not gain a synthetic 0")
+	assert_eq(McpServerLifecycleManagerScript.active_lease_count(projected), 0)
+
+
+func test_status_projection_drops_a_non_numeric_lease_count() -> void:
+	## A malformed value must not read as occupancy and keep a server alive.
+	## 1.5 is the interesting one: Godot parses every JSON number as a float, so
+	## a naive int() cast would truncate it to 1 and manufacture a held lease
+	## out of a malformed payload. Infinities and NaN are junk for the same
+	## reason. Whole floats (2.0) are the NORMAL case and must survive.
+	for junk in ["3", [], {}, null, 1.5, 0.5, -2.5, INF, -INF, NAN]:
+		var projected := GodotAiPlugin._project_status_payload({
+			"name": "godot-ai", "active_lease_count": junk,
+		})
+		assert_eq(McpServerLifecycleManagerScript.active_lease_count(projected), 0,
+			"non-numeric lease count must not read as leases held")
+
+
+func test_status_projection_keeps_whole_number_lease_counts() -> void:
+	## The other side of the fractional guard: JSON numbers arrive as floats, so
+	## rejecting floats outright would drop every real count.
+	for whole in [0.0, 1.0, 2.0, 9.0]:
+		var projected := GodotAiPlugin._project_status_payload({
+			"name": "godot-ai", "active_lease_count": whole,
+		})
+		assert_true(projected.has("active_lease_count"),
+			"a whole-number count (%s) is the normal wire shape and must project" % whole)
+		assert_eq(McpServerLifecycleManagerScript.active_lease_count(projected), int(whole))

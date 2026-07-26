@@ -984,19 +984,23 @@ func _start_server_impl(async_gen: int) -> void:
 ## the watch crossed SPAWN_GRACE_MS and reported an exit — rescued only by the
 ## crash-survivor adoption path.
 ##
-## A uv venv's `python.exe` is a shim rather than the interpreter, and the
-## real server does run under a *different* PID than the one
-## `OS.create_process` hands back — confirmed on a Windows runner (spawned
-## 7084, pid-file 6088). What is NOT confirmed is the original report's
-## suspected mechanism, that the shim exits once its child is up: on that
-## runner the spawned PID stayed alive for 90s, behaving as a live parent.
-## So the shim's exit is one possible cause of the reported death, not an
-## established one.
+## A uv venv's `python.exe` is a shim rather than the interpreter, and the real
+## server does run under a *different* PID than the one `OS.create_process`
+## hands back. But the original report's suspected mechanism — that the shim
+## exits once its child is up — is **disproven**, not merely unconfirmed. A
+## 12-boot run on Windows 11 with a uv venv found the spawned trampoline alive
+## on every boot, with the child owning both the pid-file and the listener; a
+## CI runner showed the same. The shim is a live parent for the process's whole
+## life, so it is not what kills the watched PID.
 ##
-## This gate is therefore keyed to the observable condition — watched PID
-## dead, no pid-file yet — and not to any theory of why it died. Whatever
-## kills it, waiting for the pid-file is the correct response, and when the
-## watched PID stays alive (as on that runner) this branch simply never fires.
+## Two consequences worth keeping straight. First, this gate is keyed to the
+## observable condition — watched PID dead, no pid-file yet — not to any theory
+## of why it died, so it stays correct whatever the cause. Second, and less
+## comfortable: in that same 12-boot run the false "server exited" line never
+## appeared AND the watched PID never died, so the guard never fired. Those
+## clean boots are evidence the symptom did not reproduce, NOT evidence this
+## guard fixes it. The true cause of the original 1-in-4 report is still
+## unknown; if it resurfaces, start from that rather than from the trampoline.
 ##
 ## `real_pid <= 0` means no pid-file exists yet, and that reliably means "this
 ## server has not published one" rather than "stale leftover": `start_server`
@@ -1365,8 +1369,85 @@ func recover_strong_port_occupant(port: int, wait_s: float, pre_kill_live: Dicti
 func teardown_for_editor_exit() -> void:
 	if _server_keep_alive:
 		detach_server()
-	else:
-		stop_server()
+		return
+	## #824: a backend we spawned may be keeping one or more MCP clients alive
+	## through their `godot-ai attach` bridges. Killing it because *this* editor
+	## is closing takes the server out from under them: an in-flight call can
+	## become TRANSPORT_OUTCOME_UNKNOWN, and every bridge has to establish a new
+	## backend before the next editor can reconnect. A live lease means the
+	## backend has consumers beyond this editor, so hand it over instead.
+	var leased := active_lease_count_at_exit()
+	if leased > 0:
+		## Give up kill authority along with the process: dropping the managed
+		## record means the next editor adopts it through the external branch
+		## rather than as a managed server it may kill. The server's own
+		## pid-file is deliberately left in place — it is the backend's
+		## publication, not our claim on it, and adoption reads it.
+		##
+		## The Python side remains the reaper of record: a plugin-spawned
+		## backend keeps its idle backstop armed (only keep_server_on_exit
+		## disarms it) and that backstop is lease-aware, so this defers the
+		## stop to "no editors AND no leases AND grace elapsed" rather than
+		## leaking the process.
+		_host._clear_managed_server_record()
+		detach_server(
+			"detaching server: %d attach lease(s) still held, leaving it to the "
+			% leased
+			+ "server's own idle reaper"
+		)
+		return
+	stop_server()
+
+
+## Active attach-bridge leases on the backend this editor manages, or 0 when
+## there is nothing to consult (#824).
+##
+## Returns 0 — preserving the historical kill-on-exit behavior — for every
+## uncertain case: no managed PID, a probe that fails or times out, a server
+## that does not identify as godot-ai, or one too old to publish the field.
+## That direction is deliberate. A false 0 costs what today already costs
+## (the backend is stopped and bridges reconnect); a false positive would
+## leave a process running on a guess.
+##
+## Bounded by the status probe's own timeout (SERVER_STATUS_PROBE_TIMEOUT_MS),
+## which is what keeps editor exit from hanging on a wedged HTTP server.
+func active_lease_count_at_exit() -> int:
+	var pid := int(_server_pid)
+	if pid <= 0:
+		return 0
+	## Only a process we can still prove is our godot-ai server earns the
+	## benefit of the doubt. The lease count comes from whoever answers on the
+	## port, which is not by itself proof that it IS the process we are about
+	## to stop — another editor's backend, or an attach-owned one, could hold
+	## the port after ours died. Requiring the same alive+branded proof
+	## `stop_server` uses before its kill closes that gap: without it, a
+	## stranger's leases could talk this editor out of stopping its own server.
+	##
+	## Failing this check is harmless either way. A dead PID has nothing to
+	## kill, and a recycled-but-unbranded PID is rejected by stop_server's own
+	## gate (#686) — both land on the historical path.
+	if not _host._pid_alive_for_proof(pid):
+		return 0
+	if not _host._pid_cmdline_is_godot_ai_for_proof(pid):
+		return 0
+	return active_lease_count(
+		_host._probe_live_server_status_for_port(ClientConfigurator.http_port())
+	)
+
+
+## Read the advisory lease count out of a `/godot-ai/status` payload.
+##
+## Gated on the payload identifying as godot-ai, so an unrelated process
+## answering on the port cannot talk this editor out of a clean stop. A
+## missing field means an older backend that predates #824; it reads as 0,
+## which keeps that pairing on today's behavior.
+static func active_lease_count(live: Dictionary) -> int:
+	if not _live_status_identifies_godot_ai(live):
+		return 0
+	var raw: Variant = live.get("active_lease_count")
+	if raw == null:
+		return 0
+	return maxi(0, int(raw))
 
 
 ## keep_server_on_exit (#800): editor teardown that leaves the server
@@ -1376,14 +1457,20 @@ func teardown_for_editor_exit() -> void:
 ## session's start_server walk adopts the survivor through the existing
 ## record-matches branch (#758/#774). Explicit stops (dock Restart,
 ## update reload) still route through stop_server and kill as before.
-func detach_server() -> void:
+## `log_reason` names why the server is being left alive; the default is the
+## keep_server_on_exit wording this function was written for. #824 reuses the
+## same bookkeeping for the active-lease handover, and a shared log line would
+## have reported the wrong cause for it.
+func detach_server(
+	log_reason: String = "keep_server_on_exit: leaving server running"
+) -> void:
 	_invalidate_async_startup()
 	_host._stop_server_watch()
 	var detached_pid := int(_server_pid)
 	_server_pid = -1
 	transition_state(McpServerStateScript.STOPPED)
 	if detached_pid > 0:
-		print("MCP | keep_server_on_exit: leaving server running (PID %d)" % detached_pid)
+		print("MCP | %s (PID %d)" % [log_reason, detached_pid])
 
 
 func stop_server() -> void:
