@@ -1960,7 +1960,8 @@ func _dispatch_client_action(client_id: String, action: String) -> void:
 	## The status-refresh worker uses the same pattern — see
 	## `_perform_initial_client_status_refresh` and
 	## `_request_client_status_refresh`.
-	var server_url := ClientConfigurator.http_url()
+	var launch_context := ClientConfigurator.capture_launch_context()
+	var server_url := ClientConfigurator.server_url_from(launch_context)
 	## #691: refresh the env snapshot on main before this worker starts —
 	## configure/remove resolve CLI + config paths off-thread and must not
 	## race a concurrent spawn window's setenv/unsetenv.
@@ -1972,7 +1973,9 @@ func _dispatch_client_action(client_id: String, action: String) -> void:
 	_client_action_started_msec[client_id] = Time.get_ticks_msec()
 	_client_action_names[client_id] = action
 	var err := thread.start(
-		Callable(self, "_run_client_action_worker").bind(client_id, action, server_url, generation)
+		Callable(self, "_run_client_action_worker").bind(
+			client_id, action, server_url, launch_context, generation
+		)
 	)
 	if err != OK:
 		_client_action_threads.erase(client_id)
@@ -1983,12 +1986,18 @@ func _dispatch_client_action(client_id: String, action: String) -> void:
 		_refresh_clients_summary()
 
 
-func _run_client_action_worker(client_id: String, action: String, server_url: String, generation: int) -> Dictionary:
+func _run_client_action_worker(
+	client_id: String,
+	action: String,
+	server_url: String,
+	launch_context: Dictionary,
+	generation: int,
+) -> Dictionary:
 	var result: Dictionary
 	if action == "remove":
-		result = ClientConfigurator.remove(client_id, server_url)
+		result = ClientConfigurator.remove(client_id, server_url, launch_context)
 	else:
-		result = ClientConfigurator.configure(client_id, server_url)
+		result = ClientConfigurator.configure(client_id, server_url, launch_context)
 	return {
 		"client_id": client_id,
 		"action": action,
@@ -2799,7 +2808,8 @@ func _perform_initial_client_status_refresh() -> void:
 	_warm_strategy_bytecode()
 
 	var generation := _begin_client_status_refresh_run()
-	var server_url := ClientConfigurator.http_url()
+	var launch_context := ClientConfigurator.capture_launch_context()
+	var server_url := ClientConfigurator.server_url_from(launch_context)
 	var all_probes: Array[Dictionary] = []
 
 	for client_id in _client_rows:
@@ -2816,7 +2826,7 @@ func _perform_initial_client_status_refresh() -> void:
 	_client_status_refresh_thread = Thread.new()
 	var err := _client_status_refresh_thread.start(
 		Callable(self, "_run_client_status_refresh_worker").bind(
-			all_probes, server_url, generation
+			all_probes, server_url, launch_context, generation
 		)
 	)
 	if err != OK:
@@ -2928,12 +2938,15 @@ func _request_client_status_refresh(force: bool = false) -> bool:
 	var client_probes: Array[Dictionary] = []
 	for client_id in _client_rows:
 		client_probes.append(ClientConfigurator.client_status_probe_snapshot(String(client_id)))
-	var server_url := ClientConfigurator.http_url()
+	var launch_context := ClientConfigurator.capture_launch_context()
+	var server_url := ClientConfigurator.server_url_from(launch_context)
 
 	var generation := _begin_client_status_refresh_run()
 	_client_status_refresh_thread = Thread.new()
 	var err := _client_status_refresh_thread.start(
-		Callable(self, "_run_client_status_refresh_worker").bind(client_probes, server_url, generation)
+		Callable(self, "_run_client_status_refresh_worker").bind(
+			client_probes, server_url, launch_context, generation
+		)
 	)
 	if err != OK:
 		_refresh_state = ClientRefreshStateScript.IDLE
@@ -2988,7 +3001,12 @@ func _retry_deferred_client_status_refresh() -> void:
 		_request_client_status_refresh(force)
 
 
-func _run_client_status_refresh_worker(client_probes: Array[Dictionary], server_url: String, generation: int) -> Dictionary:
+func _run_client_status_refresh_worker(
+	client_probes: Array[Dictionary],
+	server_url: String,
+	launch_context: Dictionary,
+	generation: int,
+) -> Dictionary:
 	var results: Dictionary = {}
 	for probe in client_probes:
 		var client_id := String(probe.get("id", ""))
@@ -2997,7 +3015,8 @@ func _run_client_status_refresh_worker(client_probes: Array[Dictionary], server_
 		var details := ClientConfigurator.check_status_details_for_url_with_cli_path(
 			client_id,
 			server_url,
-			String(probe.get("cli_path", ""))
+			String(probe.get("cli_path", "")),
+			launch_context,
 		)
 		var installed := bool(probe.get("installed", false))
 		results[client_id] = {

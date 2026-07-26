@@ -48,6 +48,22 @@ const SETTING_WS_PORT := "godot_ai/ws_port"
 const SETTING_STARTUP_TRACE := "godot_ai/log_startup_timing"
 const SETTING_KEEP_SERVER_ON_EXIT := "godot_ai/keep_server_on_exit"
 const _DISCOVERY_TIMEOUT_MS := 3000
+## Codex launches Windows console-subsystem MCP commands in a visible terminal.
+## A GUI-subsystem Python keeps the bridge attached to Codex's redirected MCP
+## pipes without allocating a console, then starts console launchers such as
+## uvx with CREATE_NO_WINDOW. Keep stdin/stdout/stderr explicit: pythonw can use
+## its own inherited pipes, but subprocess defaults do not reliably forward
+## them to a child when no console exists.
+## This string is a wire format written verbatim into user config `args`.
+## Whitespace or formatting changes make every existing Windows entry report
+## CONFIGURED_MISMATCH, so changing it is a deliberate migration decision, not
+## a refactor. The inline `-c` script is required because the uvx and system
+## tiers resolve a system interpreter where `godot_ai` is not importable.
+const _WINDOWS_STDIO_BOOTSTRAP := (
+	"import subprocess,sys; "
+	+ "raise SystemExit(subprocess.call(sys.argv[1:], stdin=sys.stdin, stdout=sys.stdout, "
+	+ "stderr=sys.stderr, creationflags=0x08000000))"
+)
 
 
 ## Active HTTP port: user override (if in range) or `DEFAULT_HTTP_PORT`.
@@ -62,6 +78,14 @@ static func ws_port() -> int:
 
 static func http_url() -> String:
 	return "http://127.0.0.1:%d/mcp" % http_port()
+
+
+## Read a URL already captured on the main thread without evaluating the
+## EditorSettings-backed fallback unless the snapshot is genuinely incomplete.
+static func server_url_from(launch_context: Dictionary) -> String:
+	if launch_context.has("server_url"):
+		return str(launch_context["server_url"])
+	return http_url()
 
 
 static func _read_port_setting(key: String, default_port: int) -> int:
@@ -182,7 +206,13 @@ static func excluded_domains() -> String:
 	var es := EditorInterface.get_editor_settings()
 	if es == null or not es.has_setting(McpSettings.SETTING_EXCLUDED_DOMAINS):
 		return ""
-	var raw := str(es.get_setting(McpSettings.SETTING_EXCLUDED_DOMAINS))
+	return _canonicalize_excluded_domains(str(es.get_setting(McpSettings.SETTING_EXCLUDED_DOMAINS)))
+
+
+## Pure canonicalizer shared by the main-thread LaunchContext capture and
+## tests. Unknown domains are dropped for the same startup-safety reason as
+## `excluded_domains()` above.
+static func _canonicalize_excluded_domains(raw: String) -> String:
 	var parts := PackedStringArray()
 	for p in raw.split(","):
 		var t := p.strip_edges()
@@ -193,6 +223,23 @@ static func excluded_domains() -> String:
 		parts.append(t)
 	parts.sort()
 	return ",".join(parts)
+
+
+## Snapshot every EditorSettings-backed value needed to render or verify an
+## attach launch command. Dock actions/status run on worker threads; they must
+## receive this data object rather than calling EditorInterface there (#691).
+## Call on the main thread before dispatching a worker.
+static func capture_launch_context() -> Dictionary:
+	var captured_http_port := http_port()
+	return {
+		"http_port": captured_http_port,
+		"ws_port": ws_port(),
+		"excluded_domains": excluded_domains(),
+		"plugin_version": get_plugin_version(),
+		"allow_dev_venv": mode_override() != "user",
+		"platform": OS.get_name(),
+		"server_url": "http://127.0.0.1:%d/mcp" % captured_http_port,
+	}
 
 
 ## Read the `godot_ai/allow_remote_hosts` EditorSetting as a canonicalized
@@ -262,7 +309,7 @@ static func client_display_name(id: String) -> String:
 ## reads `EditorInterface.get_editor_settings()`, which is main-thread-only.
 ## Empty defaults to the live server URL — appropriate for MCP-tool callers
 ## that always run on main.
-static func configure(id: String, url: String = "") -> Dictionary:
+static func configure(id: String, url: String = "", launch_context: Dictionary = {}) -> Dictionary:
 	var client := ClientRegistry.get_by_id(id)
 	if client == null:
 		return {"status": "error", "message": "Unknown client: %s" % id}
@@ -271,24 +318,40 @@ static func configure(id: String, url: String = "") -> Dictionary:
 	## that just landed correctly.
 	if url.is_empty():
 		url = http_url()
-	var result := _dispatch_configure(client, url)
+	var context := launch_context
+	if client.command_shape != Client.CommandShape.NONE and context.is_empty():
+		if OS.get_thread_caller_id() != OS.get_main_thread_id():
+			return {
+				"status": "error",
+				"message": "Cannot configure %s without a main-thread launch snapshot; retry from the dock." % client.display_name,
+			}
+		context = capture_launch_context()
+	var launch := (
+		resolve_attach_launch(context)
+		if client.command_shape != Client.CommandShape.NONE
+		else {}
+	)
+	var result := _dispatch_configure(client, url, launch)
 	## Trust-but-verify: a strategy may report ok and have actually written the
 	## file, yet the entry is missing/stale on the read-back path — most often
 	## because the user's installed client is reading a different file than
 	## `path_template` resolves to (issue #201). Re-read the live state and
 	## surface a clear error before the dock reports a bogus green dot.
-	return _verify_post_state(client, result, Client.Status.CONFIGURED, url, "configure")
+	return _verify_post_state(client, result, Client.Status.CONFIGURED, url, "configure", launch)
 
 
 static func check_status(id: String) -> Client.Status:
 	var client := ClientRegistry.get_by_id(id)
 	if client == null:
 		return Client.Status.NOT_CONFIGURED
-	return _dispatch_check_status(client, http_url())
+	var context := capture_launch_context() if client.command_shape != Client.CommandShape.NONE else {}
+	return _dispatch_check_status(client, http_url(), context)
 
 
-static func check_status_for_url_with_cli_path(id: String, url: String, cli_path: String) -> Client.Status:
-	return check_status_details_for_url_with_cli_path(id, url, cli_path).get("status", Client.Status.NOT_CONFIGURED)
+static func check_status_for_url_with_cli_path(
+	id: String, url: String, cli_path: String, launch_context: Dictionary = {}
+) -> Client.Status:
+	return check_status_details_for_url_with_cli_path(id, url, cli_path, launch_context).get("status", Client.Status.NOT_CONFIGURED)
 
 
 ## Detailed variant used by the dock refresh worker. Returns
@@ -296,7 +359,9 @@ static func check_status_for_url_with_cli_path(id: String, url: String, cli_path
 ## "probe timed out" on the row instead of silently flipping it to
 ## NOT_CONFIGURED. Callers that only need the status can use the simpler
 ## helper above.
-static func check_status_details_for_url_with_cli_path(id: String, url: String, cli_path: String) -> Dictionary:
+static func check_status_details_for_url_with_cli_path(
+	id: String, url: String, cli_path: String, launch_context: Dictionary = {}
+) -> Dictionary:
 	var client := ClientRegistry.get_by_id(id)
 	if client == null:
 		return {"status": Client.Status.NOT_CONFIGURED, "error_msg": ""}
@@ -306,7 +371,12 @@ static func check_status_details_for_url_with_cli_path(id: String, url: String, 
 	# a fallback-configured entry instead of always showing red.
 	if client.config_type == "cli" and cli_path.is_empty() and not client.has_json_fallback():
 		return {"status": Client.Status.NOT_CONFIGURED, "error_msg": ""}
-	return _dispatch_check_status_with_cli_path_details(client, url, cli_path)
+	if client.command_shape != Client.CommandShape.NONE and launch_context.is_empty():
+		return {
+			"status": Client.Status.ERROR,
+			"error_msg": "Missing launch-context snapshot; retry the status refresh.",
+		}
+	return _dispatch_check_status_with_cli_path_details(client, url, cli_path, launch_context)
 
 
 ## #691: main-thread pre-warm of McpPathTemplate's env snapshot, covering
@@ -348,24 +418,37 @@ static func client_status_probe_snapshot(id: String) -> Dictionary:
 ## Pass an explicit `url` when calling from a worker thread — see
 ## `configure()` above for why. The url is only used to format the
 ## verify-after-write diagnostic message; the remove itself doesn't need it.
-static func remove(id: String, url: String = "") -> Dictionary:
+static func remove(id: String, url: String = "", launch_context: Dictionary = {}) -> Dictionary:
 	var client := ClientRegistry.get_by_id(id)
 	if client == null:
 		return {"status": "error", "message": "Unknown client: %s" % id}
 	if url.is_empty():
 		url = http_url()
+	var context := launch_context
+	if client.command_shape != Client.CommandShape.NONE and context.is_empty():
+		if OS.get_thread_caller_id() != OS.get_main_thread_id():
+			return {
+				"status": "error",
+				"message": "Cannot remove %s without a main-thread launch snapshot; retry from the dock." % client.display_name,
+			}
+		context = capture_launch_context()
+	var launch := (
+		resolve_attach_launch(context)
+		if client.command_shape != Client.CommandShape.NONE
+		else {}
+	)
 	var result := _dispatch_remove(client)
-	return _verify_post_state(client, result, Client.Status.NOT_CONFIGURED, url, "remove")
+	return _verify_post_state(client, result, Client.Status.NOT_CONFIGURED, url, "remove", launch)
 
 
 # --- Strategy dispatch + verify (testable seam) --------------------------
 
-static func _dispatch_configure(client: Client, url: String) -> Dictionary:
+static func _dispatch_configure(client: Client, url: String, launch: Dictionary = {}) -> Dictionary:
 	match client.config_type:
 		"json":
 			return JsonStrategy.configure(client, SERVER_NAME, url)
 		"toml":
-			return TomlStrategy.configure(client, SERVER_NAME, url)
+			return TomlStrategy.configure(client, SERVER_NAME, url, launch)
 		"yaml":
 			return YamlStrategy.configure(client, SERVER_NAME, url)
 		"cli":
@@ -394,20 +477,37 @@ static func _dispatch_remove(client: Client) -> Dictionary:
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
 
-static func _dispatch_check_status(client: Client, url: String) -> Client.Status:
-	return _dispatch_check_status_with_cli_path(client, url, "")
+static func _dispatch_check_status(
+	client: Client, url: String, launch_context: Dictionary = {}
+) -> Client.Status:
+	return _dispatch_check_status_with_cli_path(client, url, "", launch_context)
 
 
-static func _dispatch_check_status_with_cli_path(client: Client, url: String, cli_path: String) -> Client.Status:
-	return _dispatch_check_status_with_cli_path_details(client, url, cli_path).get("status", Client.Status.NOT_CONFIGURED)
+static func _dispatch_check_status_with_cli_path(
+	client: Client, url: String, cli_path: String, launch_context: Dictionary = {}
+) -> Client.Status:
+	return _dispatch_check_status_with_cli_path_details(client, url, cli_path, launch_context).get("status", Client.Status.NOT_CONFIGURED)
 
 
-static func _dispatch_check_status_with_cli_path_details(client: Client, url: String, cli_path: String) -> Dictionary:
+static func _dispatch_check_status_with_cli_path_details(
+	client: Client,
+	url: String,
+	cli_path: String,
+	launch_context: Dictionary = {},
+	resolved_launch: Dictionary = {},
+) -> Dictionary:
 	match client.config_type:
 		"json":
 			return JsonStrategy.check_status_details(client, SERVER_NAME, url)
 		"toml":
-			return TomlStrategy.check_status_details(client, SERVER_NAME, url)
+			var launch := {}
+			if client.command_shape != Client.CommandShape.NONE:
+				launch = (
+					resolved_launch
+					if not resolved_launch.is_empty()
+					else resolve_attach_launch(launch_context)
+				)
+			return TomlStrategy.check_status_details(client, SERVER_NAME, url, launch)
 		"yaml":
 			return YamlStrategy.check_status_details(client, SERVER_NAME, url)
 		"cli":
@@ -430,10 +530,13 @@ static func _verify_post_state(
 	expected: Client.Status,
 	url: String,
 	action: String,
+	resolved_launch: Dictionary = {},
 ) -> Dictionary:
 	if result.get("status") != "ok":
 		return result
-	var actual := _dispatch_check_status(client, url)
+	var actual := _dispatch_check_status_with_cli_path_details(
+		client, url, "", {}, resolved_launch
+	).get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
 		return result
 	var path := client.resolved_config_path()
@@ -452,7 +555,19 @@ static func manual_command(id: String) -> String:
 	var client := ClientRegistry.get_by_id(id)
 	if client == null:
 		return ""
-	var cmd := ManualCommand.build(client, SERVER_NAME, http_url(), client.resolved_config_path())
+	var context := capture_launch_context() if client.command_shape != Client.CommandShape.NONE else {}
+	var launch := (
+		resolve_attach_launch(context)
+		if client.command_shape != Client.CommandShape.NONE
+		else {}
+	)
+	var cmd := ManualCommand.build(
+		client,
+		SERVER_NAME,
+		server_url_from(context),
+		client.resolved_config_path(),
+		launch,
+	)
 	if cmd.is_empty():
 		return cmd
 	## #507: when the allow-host opt-in names a non-loopback range, also
@@ -497,6 +612,210 @@ static func _pypi_pin_version(version: String) -> String:
 	if plus >= 0:
 		v = v.substr(0, plus)
 	return v
+
+
+## Resolve the client-owned `godot-ai attach` command from a main-thread
+## LaunchContext. Discovery itself is worker-safe: path/environment lookup is
+## snapshot-backed and subprocess probes are wall-clock bounded.
+##
+## `discovery_override` is a data-only test seam. Supplying a key (including
+## an empty value) bypasses that tier's live lookup; `system_version_result`
+## bypasses the real `godot-ai --version` subprocess.
+static func resolve_attach_launch(
+	launch_context: Dictionary, discovery_override: Dictionary = {}
+) -> Dictionary:
+	## Test overrides always bypass the session cache so fixture-controlled
+	## discovery remains deterministic. Production results are keyed by every
+	## setting that affects the rendered command; a port/domain/version change
+	## therefore cannot reuse stale arguments.
+	if not discovery_override.is_empty():
+		return _resolve_attach_launch_uncached(launch_context, discovery_override)
+	var cache_key := _attach_launch_cache_key(launch_context)
+	_attach_launch_cache_mutex.lock()
+	if _attach_launch_cache.has(cache_key):
+		var cached: Dictionary = _attach_launch_cache[cache_key].duplicate(true)
+		_attach_launch_cache_mutex.unlock()
+		return cached
+	## Keep the cache lock through the bounded discovery probes. This cold path
+	## runs at most once per distinct context and prevents simultaneous status
+	## workers from repeating the same subprocess probes. Invalidation waits for
+	## the in-flight result, then clears it, so stale work cannot repopulate a
+	## freshly invalidated cache.
+	var resolved := _resolve_attach_launch_uncached(launch_context)
+	_attach_launch_cache[cache_key] = resolved.duplicate(true)
+	_attach_launch_cache_mutex.unlock()
+	return resolved
+
+
+static func _resolve_attach_launch_uncached(
+	launch_context: Dictionary, discovery_override: Dictionary = {}
+) -> Dictionary:
+	for key in ["http_port", "ws_port", "excluded_domains", "plugin_version", "allow_dev_venv", "platform"]:
+		if not launch_context.has(key):
+			return _attach_discovery_error("Launch context is missing `%s`; retry Configure." % key)
+
+	var plugin_version := str(launch_context.get("plugin_version", "")).strip_edges()
+	if plugin_version.is_empty():
+		return _attach_discovery_error("The bundled godot-ai version is unavailable; reinstall the plugin and retry Configure.")
+
+	var common_args: Array[String] = [
+		"attach",
+		"--port", str(int(launch_context.get("http_port", DEFAULT_HTTP_PORT))),
+		"--ws-port", str(int(launch_context.get("ws_port", DEFAULT_WS_PORT))),
+	]
+	var exclusions := str(launch_context.get("excluded_domains", "")).strip_edges()
+	if not exclusions.is_empty():
+		common_args.append_array(["--exclude-domains", exclusions])
+
+	var venv_python := ""
+	if discovery_override.has("venv_python"):
+		venv_python = str(discovery_override["venv_python"])
+	elif bool(launch_context.get("allow_dev_venv", true)):
+		venv_python = _cached_venv_python()
+	if bool(launch_context.get("allow_dev_venv", true)) and not venv_python.is_empty():
+		var venv_args: Array[String] = ["-m", "godot_ai"]
+		venv_args.append_array(common_args)
+		return _finalize_attach_launch(
+			"dev_venv", venv_python, venv_args, launch_context, discovery_override
+		)
+
+	var uvx := ""
+	if discovery_override.has("uvx_path"):
+		uvx = str(discovery_override["uvx_path"])
+	else:
+		## Strict lookup for new attach entries. Do not use
+		## McpClient.resolve_uvx_path(): its bare-`uvx` fallback is retained
+		## solely for the existing Claude Desktop bridge until that client is
+		## migrated in its own rollout PR.
+		uvx = find_uvx()
+	if not uvx.is_empty():
+		var uvx_args: Array[String] = [
+			"--link-mode", "copy",
+			"--from", "godot-ai==%s" % _pypi_pin_version(plugin_version),
+			"godot-ai",
+		]
+		uvx_args.append_array(common_args)
+		return _finalize_attach_launch(
+			"uvx", uvx, uvx_args, launch_context, discovery_override
+		)
+
+	var system_cmd := ""
+	if discovery_override.has("system_path"):
+		system_cmd = str(discovery_override["system_path"])
+	else:
+		system_cmd = _find_system_install()
+	if not system_cmd.is_empty():
+		var probe: Dictionary
+		if discovery_override.has("system_version_result"):
+			probe = discovery_override["system_version_result"] as Dictionary
+		else:
+			probe = McpCliExec.run(system_cmd, ["--version"], _DISCOVERY_TIMEOUT_MS, false)
+		var version_check := _system_version_from_probe(probe)
+		if bool(version_check.get("ok", false)):
+			var found_version := str(version_check.get("version", ""))
+			if found_version == plugin_version:
+				return _finalize_attach_launch(
+					"system", system_cmd, common_args, launch_context, discovery_override
+				)
+			return _attach_discovery_error(
+				"System godot-ai is version %s, but this plugin requires %s. Install uv or update the system package, then retry Configure."
+				% [found_version, plugin_version]
+			)
+		if bool(probe.get("timed_out", false)):
+			return _attach_discovery_error(
+				"Timed out checking the system godot-ai version. Install uv or repair the system command, then retry Configure."
+			)
+		return _attach_discovery_error(
+			"Could not verify the system godot-ai version. Install uv or repair the system command, then retry Configure."
+		)
+
+	return _attach_discovery_error(
+		"No compatible godot-ai launcher was found. Install uv (provides uvx), or use the manual URL-mode instructions with their reconnect limitation."
+	)
+
+
+## Return a launch shape that cannot allocate a visible console on Windows.
+## The development tier can execute its sibling pythonw directly. uvx and the
+## system entry point still need their own environments, so pythonw acts only
+## as a stdio-preserving, CREATE_NO_WINDOW process bootstrap for those tiers.
+static func _finalize_attach_launch(
+	tier: String,
+	command: String,
+	args: Array[String],
+	launch_context: Dictionary,
+	discovery_override: Dictionary,
+) -> Dictionary:
+	if str(launch_context.get("platform", "")) != "Windows":
+		return {"ok": true, "tier": tier, "command": command, "args": args}
+
+	var pythonw := _resolve_consoleless_python(command, tier, discovery_override)
+	if pythonw.is_empty():
+		return _attach_discovery_error(
+			"Windows requires pythonw.exe to launch the MCP bridge without opening a terminal window. Repair this Python or uv installation, then retry Configure."
+		)
+
+	if tier == "dev_venv":
+		return {"ok": true, "tier": tier, "command": pythonw, "args": args}
+
+	var wrapped_args: Array[String] = ["-c", _WINDOWS_STDIO_BOOTSTRAP, command]
+	wrapped_args.append_array(args)
+	return {"ok": true, "tier": tier, "command": pythonw, "args": wrapped_args}
+
+
+static func _resolve_consoleless_python(
+	command: String, tier: String, discovery_override: Dictionary
+) -> String:
+	## Data-only override keeps resolver tests independent of the host's Python.
+	if discovery_override.has("consoleless_python"):
+		return str(discovery_override["consoleless_python"])
+
+	## Venv/system console-script launchers normally keep pythonw beside their
+	## python.exe. The dev tier must use that exact interpreter so godot_ai is
+	## imported from the selected checkout rather than some unrelated install.
+	var sibling := command.get_base_dir().path_join("pythonw.exe")
+	if FileAccess.file_exists(sibling):
+		return sibling
+	if tier == "dev_venv":
+		return ""
+
+	## uvx may be installed without a PATH-visible CPython. Ask its sibling uv
+	## for the already-managed system interpreter; Godot AI's existing uvx
+	## server launch ensures one normally exists before client configuration.
+	if tier == "uvx":
+		var uv := command.get_base_dir().path_join("uv.exe")
+		if not FileAccess.file_exists(uv):
+			uv = CliFinder.find(["uv.exe"])
+		if not uv.is_empty():
+			var probe := McpCliExec.run(
+				uv, ["python", "find", "--system"], _DISCOVERY_TIMEOUT_MS, false
+			)
+			if int(probe.get("exit_code", -1)) == 0:
+				var python := str(probe.get("stdout", "")).strip_edges()
+				if not python.is_empty():
+					var managed_pythonw := python.get_base_dir().path_join("pythonw.exe")
+					if FileAccess.file_exists(managed_pythonw):
+						return managed_pythonw
+
+	## A system Python GUI launcher is sufficient for the non-dev bootstrap;
+	## it does not import godot_ai itself.
+	return CliFinder.find(["pythonw.exe"])
+
+
+static func _system_version_from_probe(probe: Dictionary) -> Dictionary:
+	if int(probe.get("exit_code", -1)) != 0:
+		return {"ok": false}
+	var output := str(probe.get("stdout", "")).strip_edges()
+	var pattern := RegEx.new()
+	if pattern.compile("^godot-ai\\s+([^\\s]+)(?:\\s|$)") != OK:
+		return {"ok": false}
+	var matched := pattern.search(output)
+	if matched == null:
+		return {"ok": false}
+	return {"ok": true, "version": matched.get_string(1)}
+
+
+static func _attach_discovery_error(message: String) -> Dictionary:
+	return {"ok": false, "error": message}
 
 
 ## Override for the dev-vs-user heuristic. Accepted values:
@@ -735,6 +1054,9 @@ static func uv_probe_negative() -> bool:
 static func invalidate_uv_detection() -> void:
 	invalidate_uvx_cli_cache()
 	invalidate_uv_version_cache()
+	_attach_launch_cache_mutex.lock()
+	_attach_launch_cache.clear()
+	_attach_launch_cache_mutex.unlock()
 
 
 static var _venv_python_cache: String = ""
@@ -742,6 +1064,19 @@ static var _venv_python_searched: bool = false
 ## #678 worker threads write this cache while main-thread callers read
 ## it; same lock discipline as McpCliFinder (clients/_cli_finder.gd).
 static var _venv_mutex: Mutex = Mutex.new()
+static var _attach_launch_cache := {}
+static var _attach_launch_cache_mutex := Mutex.new()
+
+
+static func _attach_launch_cache_key(launch_context: Dictionary) -> String:
+	return JSON.stringify([
+		launch_context.get("http_port", null),
+		launch_context.get("ws_port", null),
+		launch_context.get("excluded_domains", null),
+		launch_context.get("plugin_version", null),
+		launch_context.get("allow_dev_venv", null),
+		launch_context.get("platform", null),
+	])
 
 
 static func _cached_venv_python() -> String:
