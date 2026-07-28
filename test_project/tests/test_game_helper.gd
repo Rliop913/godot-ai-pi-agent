@@ -72,6 +72,10 @@ func suite_teardown() -> void:
 
 
 func setup() -> void:
+	## Reset input_sequence test state here (not just at each test's end) so a
+	## mid-test assertion failure can't leak a registered/pressed _SEQ_ACTION
+	## into a later test.
+	_clear_seq_action()
 	if _root == null:
 		return
 	for child in _root.get_children():
@@ -373,3 +377,186 @@ func test_screenshot_reply_error_records_seam() -> void:
 	assert_eq(helper._last_screenshot_reply.get("request_id"), "rid-err")
 	assert_contains(str(helper._last_screenshot_reply.get("message")), "No game root viewport")
 	helper.free()
+
+
+# ----- input_sequence: pure plan validation (#814) -----
+
+func test_plan_input_sequence_normalizes_defaults() -> void:
+	var plan: Dictionary = _helper.call(
+		"_plan_input_sequence", {"steps": [{"at_frame": 0, "action": "jump"}]})
+	assert_false(plan.has("error"), "valid plan must not error")
+	assert_eq(plan.end_frame, 0)
+	var step: Dictionary = plan.steps[0]
+	assert_eq(step.pressed, true, "pressed defaults to true")
+	assert_eq(step.strength, 1.0, "strength defaults to 1.0")
+
+
+func test_plan_input_sequence_end_frame_includes_settle() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence", {
+		"steps": [{"at_frame": 6, "action": "jump"}],
+		"settle_frames": 5,
+	})
+	assert_eq(plan.end_frame, 11, "end_frame is last at_frame + settle_frames")
+
+
+func test_plan_input_sequence_rejects_empty() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence", {"steps": []})
+	assert_true(plan.has("error"), "empty steps must be rejected")
+
+
+func test_plan_input_sequence_rejects_out_of_order() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence", {"steps": [
+		{"at_frame": 10, "action": "a"},
+		{"at_frame": 5, "action": "b"},
+	]})
+	assert_true(plan.has("error"), "descending at_frame must be rejected")
+	assert_contains(plan.error, "ordered")
+
+
+func test_plan_input_sequence_allows_equal_frames() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence", {"steps": [
+		{"at_frame": 3, "action": "a"},
+		{"at_frame": 3, "action": "b"},
+	]})
+	assert_false(plan.has("error"), "equal at_frame (a combo) is valid")
+
+
+func test_plan_input_sequence_rejects_negative_frame() -> void:
+	var plan: Dictionary = _helper.call(
+		"_plan_input_sequence", {"steps": [{"at_frame": -1, "action": "a"}]})
+	assert_true(plan.has("error"), "negative at_frame must be rejected")
+
+
+func test_plan_input_sequence_rejects_over_frame_cap() -> void:
+	var cap: int = GameHelper.MAX_SEQUENCE_FRAMES
+	var plan: Dictionary = _helper.call("_plan_input_sequence", {
+		"steps": [{"at_frame": cap, "action": "a"}],
+		"settle_frames": 1,
+	})
+	assert_true(plan.has("error"), "spanning past the frame cap must be rejected")
+
+
+func test_plan_input_sequence_rejects_over_step_cap() -> void:
+	var steps: Array = []
+	for i in GameHelper.MAX_SEQUENCE_STEPS + 1:
+		steps.append({"at_frame": 0, "action": "a"})
+	var plan: Dictionary = _helper.call("_plan_input_sequence", {"steps": steps})
+	assert_true(plan.has("error"), "exceeding the step cap must be rejected")
+
+
+# The planner validates field *kinds* rather than coercing (matches the
+# server-side validator), so a malformed direct message can't silently change
+# meaning (pressed="false" -> true, at_frame="oops" -> 0).
+
+func test_plan_input_sequence_rejects_non_bool_pressed() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence",
+		{"steps": [{"at_frame": 0, "action": "a", "pressed": "false"}]})
+	assert_true(plan.has("error"), "string pressed must be rejected, not coerced to true")
+
+
+func test_plan_input_sequence_rejects_non_number_at_frame() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence",
+		{"steps": [{"at_frame": "oops", "action": "a"}]})
+	assert_true(plan.has("error"), "non-numeric at_frame must be rejected, not coerced to 0")
+
+
+func test_plan_input_sequence_rejects_non_number_strength() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence",
+		{"steps": [{"at_frame": 0, "action": "a", "strength": "hard"}]})
+	assert_true(plan.has("error"), "non-numeric strength must be rejected")
+
+
+func test_plan_input_sequence_rejects_non_number_settle() -> void:
+	var plan: Dictionary = _helper.call("_plan_input_sequence",
+		{"steps": [{"at_frame": 0, "action": "a"}], "settle_frames": "nope"})
+	assert_true(plan.has("error"), "non-numeric settle_frames must be rejected")
+
+
+func test_plan_input_sequence_accepts_float_frames_from_json() -> void:
+	## JSON round-trips whole numbers as float; the kind-check must still accept
+	## them (it validates number-ness, not strictly int).
+	var plan: Dictionary = _helper.call("_plan_input_sequence",
+		{"steps": [{"at_frame": 2.0, "action": "a"}], "settle_frames": 1.0})
+	assert_false(plan.has("error"), "float at_frame/settle from JSON must be accepted")
+	assert_eq(plan.end_frame, 3)
+
+
+# ----- input_sequence: async frame-stepping (#814) -----
+
+const _SEQ_ACTION := "mcp_test_seq_action"
+
+
+func _register_seq_action() -> void:
+	if not InputMap.has_action(_SEQ_ACTION):
+		InputMap.add_action(_SEQ_ACTION)
+
+
+func _clear_seq_action() -> void:
+	Input.action_release(_SEQ_ACTION)
+	if InputMap.has_action(_SEQ_ACTION):
+		InputMap.erase_action(_SEQ_ACTION)
+
+
+func test_run_input_sequence_applies_steps_across_frames() -> void:
+	## The editor test runner calls tests synchronously and never pumps
+	## `process_frame` (test_runner.gd::_run_one_test), so a real frame-await
+	## would suspend and record 0 assertions. Inject a synchronous frame-waiter
+	## so the multi-frame loop runs to completion in one call — the per-step
+	## timing (one frame each) is engine-guaranteed; what we assert here is the
+	## scheduling/application layered on top: steps fire on their scheduled
+	## frame, settle is counted, and the reply shape is right.
+	_register_seq_action()
+	var helper: GameHelper = _helper
+	helper._frame_waiter = func() -> void: pass
+	await helper._run_input_sequence("req-seq-1", {
+		"steps": [
+			{"at_frame": 0, "action": _SEQ_ACTION, "pressed": true},
+			{"at_frame": 2, "action": _SEQ_ACTION, "pressed": false},
+		],
+		"settle_frames": 1,
+	})
+	helper._frame_waiter = Callable()
+	var reply: Dictionary = helper._last_game_command_reply
+	assert_eq(reply.kind, "response", "a valid sequence replies with a response")
+	var result: Dictionary = reply.result
+	assert_eq(result.completed, true)
+	assert_eq(result.steps_applied, 2, "both steps applied across frames")
+	assert_eq(result.frames_elapsed, 3, "2 (last step) + 1 settle")
+	assert_eq(result.applied[0].at_frame, 0)
+	assert_eq(result.applied[1].at_frame, 2, "second step fires on its scheduled frame")
+	assert_false(Input.is_action_pressed(_SEQ_ACTION),
+		"the release step must have run, leaving the action up")
+	assert_eq(result.actions_pressed_at_end, [], "nothing left held")
+	# cleanup is fail-safe in setup(), so no per-test _clear_seq_action() here
+
+
+func test_run_input_sequence_reports_actions_left_pressed() -> void:
+	_register_seq_action()
+	var helper: GameHelper = _helper
+	# press with no matching release — caller must be told it's still held
+	await helper._run_input_sequence("req-seq-2", {
+		"steps": [{"at_frame": 0, "action": _SEQ_ACTION, "pressed": true}],
+	})
+	var result: Dictionary = helper._last_game_command_reply.result
+	assert_eq(result.actions_pressed_at_end, [_SEQ_ACTION])
+	assert_true(Input.is_action_pressed(_SEQ_ACTION))
+
+
+func test_run_input_sequence_unknown_action_fails_fast() -> void:
+	var helper: GameHelper = _helper
+	var absent := "mcp_definitely_not_an_action"
+	assert_false(InputMap.has_action(absent), "precondition: action must not exist")
+	await helper._run_input_sequence("req-seq-3", {
+		"steps": [{"at_frame": 0, "action": absent, "pressed": true}],
+	})
+	var reply: Dictionary = helper._last_game_command_reply
+	assert_eq(reply.kind, "error", "an unknown action must error, not apply partially")
+	assert_contains(reply.message, absent)
+	assert_false(Input.is_action_pressed(absent))
+
+
+func test_run_input_sequence_invalid_plan_replies_error() -> void:
+	var helper: GameHelper = _helper
+	await helper._run_input_sequence("req-seq-4", {"steps": []})
+	assert_eq(helper._last_game_command_reply.kind, "error",
+		"a plan error must surface as a game_command error")
