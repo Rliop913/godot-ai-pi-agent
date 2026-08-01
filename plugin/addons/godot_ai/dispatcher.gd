@@ -40,6 +40,7 @@ const DEFERRED_TIMEOUT_MS_BY_COMMAND := {
 	"stop_project": 4500,
 	"run_project": 6000,
 	"take_screenshot": 30000,
+	"check_client_status": 30000,
 	"game_eval": 15000,
 	"game_command": 15000,
 	"scan_filesystem": 30000,
@@ -79,6 +80,12 @@ func register_lazy(command_name: String, handler_key: String, method: StringName
 ## plugin.gd can release RefCounted handlers before Godot reloads their
 ## class_name scripts (issue #46). After clear(), the dispatcher is inert.
 func clear() -> void:
+	## Stop lazy handlers before releasing the cache. Handler-owned polling
+	## coroutines retain any in-flight worker and deferred-response connection
+	## across frames, then join only after the worker is no longer alive.
+	for instance in _lazy_handler_cache.values():
+		if is_instance_valid(instance) and instance.has_method("prepare_for_teardown"):
+			instance.call("prepare_for_teardown")
 	_handlers.clear()
 	## Release lazily-constructed handler instances (and the ctor args that
 	## reference plugin-lifetime objects) at the same teardown point where
@@ -93,8 +100,6 @@ func clear() -> void:
 	_log_buffer = null
 	_surfaced_error_tracker = null
 	pause_target = null
-
-
 ## Drop queued-but-unexecuted commands. Called by the connection on
 ## disconnect (#712): commands queued by the previous connection must not
 ## execute under the next one — the requester is gone, its in-flight

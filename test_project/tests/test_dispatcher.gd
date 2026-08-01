@@ -231,6 +231,15 @@ func test_run_project_has_deferred_timeout_budget() -> void:
 	)
 
 
+func test_client_status_has_30_second_deferred_timeout_budget() -> void:
+	assert_has_key(McpDispatcher.DEFERRED_TIMEOUT_MS_BY_COMMAND, "check_client_status")
+	assert_eq(
+		int(McpDispatcher.DEFERRED_TIMEOUT_MS_BY_COMMAND.check_client_status),
+		30000,
+		"dispatcher and Python client-status budgets must stay aligned",
+	)
+
+
 func test_deferred_timeout_ms_override_from_sentinel() -> void:
 	## A handler that attaches _deferred_timeout_ms claims a per-request budget
 	## (game_command's input_sequence needs ~30s where the command's table
@@ -512,6 +521,16 @@ func test_lazy_commands_share_one_cached_handler_instance() -> void:
 	assert_eq(d.dispatch_direct("lazy_count_a", {}).data.calls, 1)
 	assert_eq(d.dispatch_direct("lazy_count_b", {}).data.calls, 2,
 		"both commands must resolve against the same cached handler instance")
+
+
+func test_clear_prepares_lazy_handlers_for_teardown_before_release() -> void:
+	var d := _make_lazy_dispatcher()
+	d.dispatch_direct("lazy_echo", {"value": 1})
+	var instance = d._lazy_handler_cache.get("fixture")
+	assert_true(instance != null)
+	d.clear()
+	assert_eq(instance.teardown_calls, 1, "clear must invoke the worker-drain lifecycle hook")
+	assert_true(d._lazy_handler_cache.is_empty())
 
 
 func test_lazy_command_dispatches_via_queue_tick() -> void:

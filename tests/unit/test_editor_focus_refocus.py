@@ -10,6 +10,22 @@ from tests.unit._gdscript_text import get_func_block
 PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "plugin" / "addons" / "godot_ai"
 
 
+def _get_call_expression(source: str, function_name: str) -> str:
+    """Return one balanced call expression, including its argument list."""
+
+    start = source.index(f"{function_name}(")
+    open_paren = source.index("(", start)
+    depth = 0
+    for index in range(open_paren, len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(f"Unbalanced {function_name} call")
+
+
 def test_focus_in_uses_async_cooled_down_refresh_instead_of_blocking_sweep() -> None:
     """Focus-in should keep automatic refresh without blocking the editor thread."""
 
@@ -476,6 +492,87 @@ def test_worker_uses_main_thread_probe_snapshot_for_cli_paths() -> None:
     assert "McpClientConfigurator.is_installed" not in worker_block
     assert "resolve_cli_path" in configurator_source
     assert "check_status_with_cli_path" in cli_source
+
+
+def test_status_aggregates_resolve_shared_attach_launch_once() -> None:
+    """Claude Desktop and Codex must not each pay cold launch discovery."""
+
+    dock_source = (PLUGIN_ROOT / "mcp_dock.gd").read_text(encoding="utf-8")
+    configurator_source = (PLUGIN_ROOT / "client_configurator.gd").read_text(
+        encoding="utf-8"
+    )
+    worker_block = get_func_block(dock_source, "func _run_client_status_refresh_worker")
+    handler_worker_block = get_func_block(
+        configurator_source, "static func run_client_status_sweep"
+    )
+
+    assert worker_block.count("resolve_attach_launch(") == 1
+    assert handler_worker_block.count("resolve_attach_launch(") == 1
+    for block in (worker_block, handler_worker_block):
+        call = _get_call_expression(
+            block, "check_status_details_for_url_with_cli_path"
+        )
+        assert "resolved_launch" in call
+
+
+def test_handler_client_status_sweep_is_deferred_to_worker() -> None:
+    """WebSocket dispatch must not perform client probes on the handler thread."""
+
+    source = (PLUGIN_ROOT / "handlers" / "client_handler.gd").read_text(
+        encoding="utf-8"
+    )
+    configurator_source = (PLUGIN_ROOT / "client_configurator.gd").read_text(
+        encoding="utf-8"
+    )
+    handler_block = get_func_block(source, "func check_client_status")
+    worker_block = get_func_block(
+        configurator_source, "static func run_client_status_sweep"
+    )
+
+    assert "McpDispatcher.DEFERRED_RESPONSE" in handler_block
+    assert "_finish_client_status_deferred" in handler_block
+    assert "capture_launch_context" not in handler_block
+    assert "check_status_details_for_url_with_cli_path" not in handler_block
+    assert "capture_launch_context" in worker_block
+    assert "check_status_details_for_url_with_cli_path" in worker_block
+
+
+def test_handler_client_status_worker_surfaces_errors_and_polls_on_teardown() -> None:
+    """Aggregate errors stay actionable and teardown never blocks on a live Thread."""
+
+    handler_source = (PLUGIN_ROOT / "handlers" / "client_handler.gd").read_text(
+        encoding="utf-8"
+    )
+    configurator_source = (PLUGIN_ROOT / "client_configurator.gd").read_text(
+        encoding="utf-8"
+    )
+    dispatcher_source = (PLUGIN_ROOT / "dispatcher.gd").read_text(encoding="utf-8")
+    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
+
+    entry_block = get_func_block(
+        configurator_source, "static func _client_status_sweep_entry"
+    )
+    teardown_block = get_func_block(handler_source, "func prepare_for_teardown")
+    finish_block = get_func_block(
+        handler_source, "func _finish_client_status_deferred"
+    )
+    clear_block = get_func_block(dispatcher_source, "func clear() -> void:")
+    update_reload_block = get_func_block(
+        plugin_source, "func prepare_for_update_reload() -> void:"
+    )
+
+    assert 'entry["error"] = error_msg' in entry_block
+    assert "_status_tearing_down = true" in teardown_block
+    assert "wait_to_finish" not in teardown_block
+    assert "while worker.is_alive()" in finish_block
+    assert "await tree.process_frame" in finish_block
+    assert "worker.wait_to_finish()" in finish_block
+    assert "_status_workers.erase(worker)" in finish_block
+    assert "static func _finish_client_status_deferred" not in handler_source
+    assert "var _status_workers: Array[Thread] = []" in handler_source
+    assert 'instance.has_method("prepare_for_teardown")' in clear_block
+    assert 'instance.call("prepare_for_teardown")' in clear_block
+    assert "_dispatcher.clear()" in update_reload_block
 
 
 def test_refresh_timeout_can_abandon_stale_worker_results() -> None:

@@ -16,13 +16,19 @@ const INDENT := "  "  # YAML forbids tab indentation; match the 2-space style of
 
 
 static func configure(client: McpClient, server_name: String, server_url: String) -> Dictionary:
-	var path := client.resolved_config_path()
+	var resolution := client.resolved_config_path_details()
+	var path := str(resolution.get("path", ""))
+	var path_error := str(resolution.get("error", ""))
+	if not path_error.is_empty():
+		return {"status": "error", "message": path_error}
 	if path.is_empty():
 		return {"status": "error", "message": "Could not resolve config path for %s on this OS" % client.display_name}
 
-	var read := _read(path)
+	var seed_path := str(resolution.get("seed_path", ""))
+	var read_path := seed_path if not FileAccess.file_exists(path) and not seed_path.is_empty() else path
+	var read := _read(read_path)
 	if not read["ok"]:
-		return {"status": "error", "message": "Refusing to overwrite %s: %s. Fix or move the file, then re-run Configure." % [path, read["error"]]}
+		return {"status": "error", "message": "Refusing to overwrite %s: %s. Fix or move the file, then re-run Configure." % [read_path, read["error"]]}
 
 	var text: String = read["data"]
 	var block := _extract_block(text)
@@ -48,7 +54,11 @@ static func check_status(client: McpClient, server_name: String, server_url: Str
 ## NOT_CONFIGURED — so the dock row can tell "no config" from "config the
 ## editor can't read" instead of offering a Configure that would fail.
 static func check_status_details(client: McpClient, server_name: String, server_url: String) -> Dictionary:
-	var path := client.resolved_config_path()
+	var resolution := client.resolved_config_path_details()
+	var path := str(resolution.get("path", ""))
+	var path_error := str(resolution.get("error", ""))
+	if not path_error.is_empty():
+		return {"status": McpClient.Status.ERROR, "error_msg": path_error}
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
 	var read := _read(path)
@@ -70,7 +80,11 @@ static func check_status_details(client: McpClient, server_name: String, server_
 
 
 static func remove(client: McpClient, server_name: String) -> Dictionary:
-	var path := client.resolved_config_path()
+	var resolution := client.resolved_config_path_details()
+	var path := str(resolution.get("path", ""))
+	var path_error := str(resolution.get("error", ""))
+	if not path_error.is_empty():
+		return {"status": "error", "message": path_error}
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return {"status": "ok", "message": "Not configured"}
 	var read := _read(path)
