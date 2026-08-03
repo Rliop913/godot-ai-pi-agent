@@ -860,6 +860,16 @@ func _build_client_row(client_id: String) -> void:
 	var name_label := Label.new()
 	name_label.text = ClientConfigurator.client_display_name(client_id)
 	name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	## #838/#816 step 11: say which transport Configure will write — the
+	## client-owned attach bridge or the client's native URL mode.
+	var transport_tag := Label.new()
+	transport_tag.text = _client_transport_tag(client_id)
+	transport_tag.add_theme_color_override("font_color", COLOR_MUTED)
+	transport_tag.tooltip_text = (
+		"Configure writes a local `godot-ai attach` launch command for this client."
+		if transport_tag.text == "attach"
+		else "Configure writes this client's native URL entry."
+	)
 	## Long error messages from `_verify_post_state` (e.g. "reported remove ok
 	## but verification still reads configured…") used to push the Retry /
 	## Configure button off-screen — the row's Label wanted its full text
@@ -870,6 +880,7 @@ func _build_client_row(client_id: String) -> void:
 	name_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	row.add_child(name_label)
+	row.add_child(transport_tag)
 
 	var configure_btn := Button.new()
 	configure_btn.text = "Configure"
@@ -1033,6 +1044,7 @@ func _update_status() -> void:
 
 	_update_crash_panel(server_status)
 	_refresh_server_version_label(server_status)
+	_refresh_server_label(server_status)
 
 	## A transient disconnect reason remains in the transport snapshot until
 	## handshake_ack. Once the dock renders the connection as OPEN, do not pair
@@ -1331,13 +1343,42 @@ func _on_port_apply_requested(new_port: int) -> void:
 	_on_reload_plugin()
 
 
-func _refresh_server_label() -> void:
+func _refresh_server_label(server_status: Dictionary = {}) -> void:
 	if _server_label == null:
 		return
 	var ws_port := ClientConfigurator.ws_port()
 	if _plugin != null and _plugin.has_method("get_resolved_ws_port"):
 		ws_port = int(_plugin.get_resolved_ws_port())
-	_server_label.text = "WS: %d  HTTP: %d" % [ws_port, ClientConfigurator.http_port()]
+	var text := "WS: %d  HTTP: %d" % [ws_port, ClientConfigurator.http_port()]
+	if server_status.is_empty() and _plugin != null and _plugin.has_method("get_server_status"):
+		server_status = _plugin.get_server_status()
+	if _plugin != null and _plugin.has_method("get_server_pid"):
+		var ownership := _server_ownership_tag(
+			int(server_status.get("state", ServerStateScript.UNINITIALIZED)),
+			int(_plugin.get_server_pid()),
+		)
+		if not ownership.is_empty():
+			text += "  ·  %s" % ownership
+	_server_label.text = text
+
+
+## #838/#816 step 11: name which backend flavor the editor is riding.
+## Diagnostic display only — never kill proof (external adoption clears PID
+## authority, see server_lifecycle.gd::adopt_compatible_server / #669).
+static func _server_ownership_tag(state: int, server_pid: int) -> String:
+	if state != ServerStateScript.READY:
+		return ""
+	return "plugin-managed backend" if server_pid > 0 else "externally adopted backend"
+
+
+## "attach" when Configure writes a client-owned launch command for this
+## client, "URL" when it writes the client's native URL entry. Derived from
+## descriptor data so the tag can never disagree with what Configure does.
+static func _client_transport_tag(client_id: String) -> String:
+	var client := ClientRegistry.get_by_id(client_id)
+	if client == null:
+		return ""
+	return "URL" if client.command_shape == Client.CommandShape.NONE else "attach"
 
 
 # --- Telemetry setting persistence ---

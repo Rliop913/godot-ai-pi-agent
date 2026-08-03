@@ -40,7 +40,7 @@ static func configure(
 
 	if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
 		return {"status": "error", "message": "Cannot write to %s" % path}
-	return {"status": "ok", "message": "%s configured (HTTP: %s)" % [client.display_name, server_url]}
+	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 
 
 static func check_status(
@@ -121,10 +121,17 @@ static func build_entry(
 	existing: Variant = null,
 	launch: Dictionary = {},
 ) -> Dictionary:
-	if client.command_shape == McpClient.CommandShape.FLAT:
+	if _is_supported_command_shape(client.command_shape):
 		var command_entry: Dictionary = (existing as Dictionary).duplicate(true) if existing is Dictionary else {}
-		command_entry["command"] = str(launch.get("command", ""))
-		command_entry["args"] = _array_copy(launch.get("args", []))
+		if client.command_shape == McpClient.CommandShape.COMMAND_ARRAY:
+			## OpenCode-style: the entry's `command` field IS the argv array.
+			## A stale sibling `args` from a FLAT-style hand edit would be
+			## ambiguous next to it, so it is strategy-owned and removed.
+			command_entry["command"] = _launch_argv(launch)
+			command_entry.erase("args")
+		else:
+			command_entry["command"] = str(launch.get("command", ""))
+			command_entry["args"] = _array_copy(launch.get("args", []))
 		if not client.command_transport_key.is_empty():
 			command_entry[client.command_transport_key] = client.command_transport_value
 		for key in client.command_initial_fields:
@@ -163,7 +170,7 @@ static func verify_entry(
 	launch: Dictionary = {},
 ) -> bool:
 	if client.command_shape != McpClient.CommandShape.NONE:
-		if client.command_shape != McpClient.CommandShape.FLAT or not bool(launch.get("ok", false)):
+		if not _is_supported_command_shape(client.command_shape) or not bool(launch.get("ok", false)):
 			return false
 		for key in client.command_legacy_keys:
 			if entry.has(String(key)):
@@ -173,10 +180,16 @@ static func verify_entry(
 			for key in client.command_env_legacy_keys:
 				if env.has(String(key)):
 					return false
-		if entry.get("command") != launch.get("command"):
-			return false
-		if not _arrays_equal(entry.get("args", null), launch.get("args", null)):
-			return false
+		if client.command_shape == McpClient.CommandShape.COMMAND_ARRAY:
+			if not _arrays_equal(entry.get("command", null), _launch_argv(launch)):
+				return false
+			if entry.has("args"):
+				return false
+		else:
+			if entry.get("command") != launch.get("command"):
+				return false
+			if not _arrays_equal(entry.get("args", null), launch.get("args", null)):
+				return false
 		if not client.command_transport_key.is_empty():
 			if not entry.has(client.command_transport_key):
 				return false
@@ -194,11 +207,22 @@ static func verify_entry(
 static func command_launch_error(client: McpClient, launch: Dictionary) -> String:
 	if client.command_shape == McpClient.CommandShape.NONE:
 		return ""
-	if client.command_shape != McpClient.CommandShape.FLAT:
+	if not _is_supported_command_shape(client.command_shape):
 		return "%s uses a command shape not supported by JSON yet" % client.display_name
 	if not bool(launch.get("ok", false)):
 		return str(launch.get("error", "No compatible attach launcher was found."))
 	return ""
+
+
+static func _is_supported_command_shape(shape: McpClient.CommandShape) -> bool:
+	return shape == McpClient.CommandShape.FLAT or shape == McpClient.CommandShape.COMMAND_ARRAY
+
+
+## The full launch argv as one array: launcher path followed by every arg.
+static func _launch_argv(launch: Dictionary) -> Array:
+	var argv: Array = [str(launch.get("command", ""))]
+	argv.append_array(_array_copy(launch.get("args", [])))
+	return argv
 
 
 static func _remove_legacy_env_keys(entry: Dictionary, legacy_keys: PackedStringArray) -> void:

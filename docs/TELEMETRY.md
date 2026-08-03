@@ -80,6 +80,14 @@ Open the "Clients & Settings" popup from the Godot AI dock, go to the
 Restart Server" to apply the change. The preference is persisted in
 EditorSettings and survives across editor restarts.
 
+The preference reaches both server-spawn paths: plugin-spawned servers get
+`GODOT_AI_DISABLE_TELEMETRY` injected into their environment at spawn time,
+and client-owned `godot-ai attach` entries carry `--disable-telemetry` on
+their argv (the bridge sets the same env var for itself and any backend it
+spawns). Attach entries written before the toggle changed read as
+`configured_mismatch` — re-run Configure so the client relaunches the bridge
+with the current preference.
+
 ### Via environment variable
 
 Set either environment variable to `true` / `1` / `yes` / `on`:

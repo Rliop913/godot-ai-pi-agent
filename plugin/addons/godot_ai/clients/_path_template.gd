@@ -24,10 +24,10 @@ static var _env_snapshot := {}
 static var _env_snapshot_mutex := Mutex.new()
 
 ## Every var this layer and its sibling consumers (`_base.gd`
-## `config_home_override`, `_cli_finder.gd` lookups,
+## `config_file_override_details`, `config_home_override`, `_cli_finder.gd` lookups,
 ## `client_configurator.gd` mode/trace reads) can touch off-main.
-## Descriptor-declared `config_home_env` names are passed as extras by
-## the warm callers.
+## Descriptor-declared config-file/config-home env names are passed as extras
+## by the warm callers.
 const _BASE_ENV_VARS: Array[String] = [
 	"HOME",
 	"USERPROFILE",

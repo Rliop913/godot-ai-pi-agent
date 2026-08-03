@@ -49,6 +49,45 @@ func test_launch_resolver_dev_venv_shape() -> void:
 	)
 
 
+func test_disabled_telemetry_renders_flag_and_participates_in_drift() -> void:
+	## The editor's env-injection opt-out path never runs for a client-spawned
+	## bridge/backend, so the preference must ride the attach argv (#838 smoke).
+	var overrides := {
+		"venv_python": "C:/repo/.venv/Scripts/python.exe",
+		"uvx_path": "",
+		"system_path": "",
+		"consoleless_python": "C:/repo/.venv/Scripts/pythonw.exe",
+	}
+	var context := _context()
+	context["telemetry_enabled"] = false
+	var launch := McpClientConfigurator.resolve_attach_launch(context, overrides)
+	assert_true(bool(launch.get("ok", false)))
+	assert_eq(
+		launch.get("args"),
+		["-m", "godot_ai", "attach", "--port", "8123", "--ws-port", "9623", "--disable-telemetry"],
+	)
+
+	## Enabled AND absent (hand-built contexts, stale pre-upgrade snapshots)
+	## must both render without the flag — send-by-default matches the server.
+	var enabled_context := _context()
+	enabled_context["telemetry_enabled"] = true
+	for ctx in [enabled_context, _context()]:
+		var clean := McpClientConfigurator.resolve_attach_launch(ctx, overrides)
+		assert_eq(
+			clean.get("args"),
+			["-m", "godot_ai", "attach", "--port", "8123", "--ws-port", "9623"],
+			"telemetry on (or unspecified) must not add the flag",
+		)
+
+	## A toggle is launch drift: distinct cache keys, so a stale resolution
+	## cannot serve an argv rendered under the old preference.
+	assert_ne(
+		McpClientConfigurator._attach_launch_cache_key(context),
+		McpClientConfigurator._attach_launch_cache_key(enabled_context),
+		"telemetry preference must key the launch cache",
+	)
+
+
 func test_windows_dev_resolver_discovers_sibling_pythonw() -> void:
 	var python := _scratch_dir.path_join("python.exe")
 	var pythonw := _scratch_dir.path_join("pythonw.exe")
@@ -508,6 +547,241 @@ func test_server_url_from_prefers_captured_snapshot() -> void:
 		McpClientConfigurator.server_url_from({"server_url": "http://captured:8123/mcp"}),
 		"http://captured:8123/mcp",
 	)
+
+
+func test_registry_wide_attach_shape_declarations() -> void:
+	## One row per registered client — the #838 decision table, pinned. A new
+	## client must take an explicit position here (shape + pin + legacy keys).
+	var expectations := {
+		"claude_code": [McpClient.CommandShape.FLAT, "stdio", ["url"]],
+		"claude_desktop": [McpClient.CommandShape.FLAT, null, ["url"]],
+		"codex": [McpClient.CommandShape.COMMAND_ARRAY, null, ["url"]],
+		"cursor": [McpClient.CommandShape.FLAT, "stdio", ["url"]],
+		"antigravity": [McpClient.CommandShape.FLAT, null, ["serverUrl"]],
+		"gemini_cli": [McpClient.CommandShape.FLAT, null, ["httpUrl", "url"]],
+		"qwen_code": [McpClient.CommandShape.FLAT, null, ["httpUrl", "url"]],
+		"kiro": [McpClient.CommandShape.FLAT, null, ["url"]],
+		"kimi_code": [McpClient.CommandShape.FLAT, null, ["url", "transport"]],
+		"windsurf": [McpClient.CommandShape.FLAT, null, ["serverUrl"]],
+		"zed": [McpClient.CommandShape.FLAT, null, ["url", "headers", "oauth"]],
+		"cline": [McpClient.CommandShape.FLAT, "stdio", ["url", "headers"]],
+		"roo_code": [McpClient.CommandShape.FLAT, "stdio", ["url", "headers"]],
+		"zoo_code": [McpClient.CommandShape.FLAT, "stdio", ["url", "headers"]],
+		"kilo_code": [McpClient.CommandShape.FLAT, null, ["url", "type", "headers"]],
+		"trae": [McpClient.CommandShape.FLAT, null, ["url", "headers"]],
+		"vscode": [McpClient.CommandShape.FLAT, "stdio", ["url", "headers"]],
+		"vscode_insiders": [McpClient.CommandShape.FLAT, "stdio", ["url", "headers"]],
+		"opencode": [McpClient.CommandShape.COMMAND_ARRAY, "local", ["url", "headers"]],
+		"grok": [McpClient.CommandShape.COMMAND_ARRAY, null, ["url", "headers"]],
+		"hermes": [McpClient.CommandShape.FLAT, null, ["url", "headers"]],
+		## cherry_studio deliberately stays URL-mode: its mcp_servers.json is
+		## not read by the app at all (SQLite-backed) — see #838 follow-up.
+		"cherry_studio": [McpClient.CommandShape.NONE, null, []],
+	}
+	for id in McpClientRegistry.ids():
+		assert_true(expectations.has(String(id)), "client %s has no #838 shape expectation — add one" % id)
+		var client := McpClientRegistry.get_by_id(String(id))
+		var expected: Array = expectations[String(id)]
+		assert_eq(client.command_shape, expected[0], "%s shape" % id)
+		if expected[1] == null:
+			assert_true(client.command_transport_key.is_empty(), "%s must not pin a transport" % id)
+		else:
+			assert_eq(client.command_transport_value, expected[1], "%s transport pin" % id)
+		for legacy_key in expected[2]:
+			assert_true(
+				client.command_legacy_keys.has(String(legacy_key)),
+				"%s must scrub legacy key %s" % [id, legacy_key],
+			)
+		if client.command_shape != McpClient.CommandShape.NONE and String(id) != "claude_desktop":
+			assert_true(client.command_supports_url_fallback, "%s keeps a URL fallback" % id)
+
+
+func test_cli_format_args_expands_launch_tokens_whole_element_only() -> void:
+	var launch := _uvx_launch("audio")
+	var argv := McpCliStrategy.format_args(
+		PackedStringArray(["mcp", "add", "--scope", "user", "{name}", "--", "{command}", "{args...}"]),
+		"godot-ai",
+		"http://unused",
+		launch,
+	)
+	var expected: Array[String] = ["mcp", "add", "--scope", "user", "godot-ai", "--", str(launch.get("command"))]
+	for launch_arg in launch.get("args", []):
+		expected.append(str(launch_arg))
+	assert_eq(argv, expected)
+	## Whole-element contract: embedded token text is NOT expanded, while the
+	## substring tokens {name}/{url} keep their historical replacement rule.
+	var literal := McpCliStrategy.format_args(
+		PackedStringArray(["prefix-{command}", "x{args...}y", "{name}-suffix"]), "godot-ai", "u", launch
+	)
+	assert_eq(literal, ["prefix-{command}", "x{args...}y", "godot-ai-suffix"])
+
+
+func test_cli_configure_and_status_fail_closed_without_launcher() -> void:
+	var client := _claude_cli_clone(_scratch_dir.path_join("unused_cli.json"))
+	var unavailable := {"ok": false, "error": "Install uv (provides uvx), then retry Configure."}
+	var result := McpCliStrategy.configure(client, "godot-ai", "http://unused", unavailable)
+	assert_eq(result.get("status"), "error")
+	assert_contains(str(result.get("message", "")), "Install uv")
+	## The launch gate must precede any CLI probing — a bogus binary never
+	## spawns, and the error names the launcher problem, not the binary.
+	assert_false(str(result.get("message", "")).contains("not found"))
+	var details := McpCliStrategy.check_status_details(
+		client, "godot-ai", "http://unused", "/definitely/missing/claude", unavailable
+	)
+	assert_eq(details.get("status"), McpClient.Status.ERROR)
+	assert_contains(str(details.get("error_msg", "")), "Install uv")
+
+
+func test_claude_cli_json_fallback_migrates_legacy_http_entry() -> void:
+	var path := _scratch_dir.path_join("claude_cli_fallback.json")
+	var launch := _uvx_launch()
+	_write(
+		path,
+		JSON.stringify({
+			"mcpServers": {
+				"godot-ai": {"type": "http", "url": "http://127.0.0.1:8000/mcp"},
+				"someone-else": {"type": "http", "url": "http://other/"},
+			}
+		}),
+	)
+	var client := _claude_cli_clone(path)
+	## Legacy HTTP entry reads as migration drift, with a "present" fake CLI —
+	## proving the JSON file is authoritative for command-shape CLI clients.
+	var before := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "http://127.0.0.1:8000/mcp", "/fake/claude-not-invoked", {}, launch
+	)
+	assert_eq(before.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	## The clone's cli_names never resolve, so dispatch takes the JSON
+	## fallback write path with the launch threaded through.
+	var result := McpClientConfigurator._dispatch_configure(client, "http://127.0.0.1:8000/mcp", launch)
+	assert_eq(result.get("status"), "ok", str(result.get("message", "")))
+	var written: Dictionary = JSON.parse_string(_read(path))
+	var entry: Dictionary = written.get("mcpServers", {}).get("godot-ai", {})
+	assert_eq(entry.get("type"), "stdio", "legacy http pin must flip to stdio")
+	assert_false(entry.has("url"), "legacy url must be removed")
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_eq(entry.get("args"), launch.get("args"))
+	assert_true(written.get("mcpServers", {}).has("someone-else"), "unrelated entries survive")
+	var after := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "http://127.0.0.1:8000/mcp", "/fake/claude-not-invoked", {}, launch
+	)
+	assert_eq(after.get("status"), McpClient.Status.CONFIGURED)
+	## An env: {} written by the real `claude mcp add` must not read as drift.
+	entry["env"] = {}
+	written["mcpServers"]["godot-ai"] = entry
+	_write(path, JSON.stringify(written))
+	var with_empty_env := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "http://127.0.0.1:8000/mcp", "/fake/claude-not-invoked", {}, launch
+	)
+	assert_eq(with_empty_env.get("status"), McpClient.Status.CONFIGURED)
+
+
+func test_opencode_command_array_renders_and_migrates() -> void:
+	var launch := _uvx_launch("audio")
+	var client := McpClientRegistry.get_by_id("opencode")
+	var legacy := {
+		"type": "remote",
+		"url": "http://127.0.0.1:8000/mcp",
+		"enabled": false,
+		"environment": {"KEEP": "1"},
+	}
+	var entry := McpJsonStrategy.build_entry(client, "http://unused", legacy, launch)
+	var expected_argv: Array = [str(launch.get("command"))]
+	expected_argv.append_array(launch.get("args", []))
+	assert_eq(entry.get("command"), expected_argv, "command must be ONE argv array")
+	assert_false(entry.has("args"), "OpenCode has no separate args key")
+	assert_eq(entry.get("type"), "local", "schema-required discriminator must flip remote→local")
+	assert_false(entry.has("url"))
+	assert_eq(entry.get("enabled"), false, "user toggle survives")
+	assert_eq(entry.get("environment", {}).get("KEEP"), "1", "user environment survives")
+	assert_true(McpJsonStrategy.verify_entry(client, entry, "http://unused", launch))
+	var stray_args := entry.duplicate(true)
+	stray_args["args"] = ["stale"]
+	assert_false(
+		McpJsonStrategy.verify_entry(client, stray_args, "http://unused", launch),
+		"a stale sibling args key is drift — ambiguous next to the argv array",
+	)
+	var argv_drift := entry.duplicate(true)
+	argv_drift["command"] = expected_argv.slice(0, expected_argv.size() - 1)
+	assert_false(McpJsonStrategy.verify_entry(client, argv_drift, "http://unused", launch))
+	var fresh := McpJsonStrategy.build_entry(client, "http://unused", null, launch)
+	assert_eq(fresh.get("enabled"), true, "fresh entries seed enabled: true")
+
+
+func test_grok_renders_attach_toml_and_preserves_undocumented_enabled() -> void:
+	var path := _scratch_dir.path_join("grok_attach.toml")
+	_write(
+		path,
+		'[mcp_servers."godot-ai"]\n'
+		+ 'url = "http://127.0.0.1:8000/mcp"\n'
+		+ "enabled = false\n"
+		+ "tool_timeout_sec = 420\n",
+	)
+	var client := _grok_clone(path)
+	var launch := _uvx_launch()
+	assert_eq(
+		McpTomlStrategy.check_status(client, "godot-ai", "", launch),
+		McpClient.Status.CONFIGURED_MISMATCH,
+		"legacy url section must read as migration drift",
+	)
+	var result := McpTomlStrategy.configure(client, "godot-ai", "http://unused", launch)
+	assert_eq(result.get("status"), "ok", str(result.get("message", "")))
+	var content := _read(path)
+	assert_false(content.contains("url ="), "legacy url must be removed")
+	assert_contains(content, "command = ")
+	assert_contains(content, "args = [")
+	assert_contains(content, "enabled = false", "undocumented user key must survive untouched")
+	assert_false(content.contains("enabled = true"), "seeding must not overwrite the user's toggle")
+	assert_contains(content, "tool_timeout_sec = 420", "user-tuned timeout must survive")
+	## Initial seeding is per-key: the legacy entry had no startup override, so
+	## migration seeds the uvx cold-start headroom (docs default 30s is too
+	## tight for a first `uvx` package install).
+	assert_contains(content, "startup_timeout_sec = 60")
+	assert_eq(McpTomlStrategy.check_status(client, "godot-ai", "", launch), McpClient.Status.CONFIGURED)
+	## A user-tuned startup value must survive a later reconfigure untouched.
+	_write(path, _read(path).replace("startup_timeout_sec = 60", "startup_timeout_sec = 90"))
+	assert_eq(McpTomlStrategy.configure(client, "godot-ai", "http://unused", launch).get("status"), "ok")
+	assert_contains(_read(path), "startup_timeout_sec = 90")
+
+
+func _claude_cli_clone(path: String) -> McpClient:
+	var registered := McpClientRegistry.get_by_id("claude_code")
+	var client := McpClient.new()
+	client.id = "claude_code_test"
+	client.display_name = "Claude Code Test"
+	client.config_type = "cli"
+	client.cli_names = PackedStringArray(["definitely-missing-claude-xyz"])
+	client.cli_register_template = registered.cli_register_template
+	client.cli_unregister_template = registered.cli_unregister_template
+	client.cli_status_args = registered.cli_status_args
+	client.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	client.server_key_path = PackedStringArray(["mcpServers"])
+	client.entry_extra_fields = registered.entry_extra_fields.duplicate(true)
+	client.command_shape = registered.command_shape
+	client.command_transport_key = registered.command_transport_key
+	client.command_transport_value = registered.command_transport_value
+	client.command_legacy_keys = registered.command_legacy_keys
+	client.command_user_fields = registered.command_user_fields
+	client.command_supports_url_fallback = registered.command_supports_url_fallback
+	return client
+
+
+func _grok_clone(path: String) -> McpClient:
+	var registered := McpClientRegistry.get_by_id("grok")
+	var client := McpClient.new()
+	client.id = "grok_test"
+	client.display_name = "Grok Test"
+	client.config_type = "toml"
+	client.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	client.toml_section_path = registered.toml_section_path
+	client.toml_legacy_section_aliases = registered.toml_legacy_section_aliases
+	client.command_shape = registered.command_shape
+	client.command_supports_url_fallback = registered.command_supports_url_fallback
+	client.command_legacy_keys = registered.command_legacy_keys
+	client.command_initial_fields = registered.command_initial_fields.duplicate(true)
+	client.command_user_fields = registered.command_user_fields
+	client.command_timeout_fields = registered.command_timeout_fields
+	return client
 
 
 func _context(exclusions: String = "") -> Dictionary:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from collections.abc import Sequence
 
@@ -32,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
         "--exclude-domains",
         default="",
         help="Comma-separated backend tool domains to exclude",
+    )
+    parser.add_argument(
+        "--disable-telemetry",
+        action="store_true",
+        help="Disable anonymous telemetry in this bridge and any backend it spawns",
     )
     return parser
 
@@ -70,6 +76,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         exclude_domains = tuple(sorted(parse_exclude_list(args.exclude_domains)))
     except ValueError as exc:
         parser.error(str(exc))
+    if args.disable_telemetry:
+        ## The editor's telemetry opt-out only reaches plugin-spawned servers
+        ## via env injection at spawn time (server_lifecycle.gd). An attach
+        ## backend is spawned by THIS process with a copy of os.environ
+        ## (ensure._backend_spawn_env), so the client entry carries the opt-out
+        ## as an argv flag and the bridge translates it back into the env
+        ## contract telemetry.py already honors.
+        os.environ["GODOT_AI_DISABLE_TELEMETRY"] = "true"
     try:
         asyncio.run(run_attach(args.port, args.ws_port, exclude_domains))
     except AttachStartupError as exc:

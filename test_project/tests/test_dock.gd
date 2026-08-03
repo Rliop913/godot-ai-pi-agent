@@ -1907,3 +1907,29 @@ func test_tool_catalog_is_excludable_domain_filters_unknown_names() -> void:
 		"a name no longer in the catalog must be rejected")
 	assert_false(McpToolCatalog.is_excludable_domain(""),
 		"empty is not a domain")
+
+
+func test_server_ownership_tag_distinguishes_backend_flavor() -> void:
+	## #838/#816 step 11: the server line names which backend flavor the
+	## editor is riding. Display only — external adoption clears PID
+	## authority, so this text is never kill proof (#669).
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.READY, 12345), "plugin-managed backend")
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.READY, -1), "externally adopted backend")
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.UNINITIALIZED, 12345), "",
+		"no tag before the lifecycle reaches READY")
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.CRASHED, -1), "",
+		"terminal diagnoses keep the plain ports label")
+
+
+func test_client_transport_tag_tracks_descriptor_shape() -> void:
+	## #838: the row tag must always agree with what Configure writes, so it
+	## derives from descriptor command_shape — attach for every migrated
+	## client (any config_type), URL for the deliberate holdouts.
+	assert_eq(McpDockScript._client_transport_tag("cursor"), "attach")
+	assert_eq(McpDockScript._client_transport_tag("claude_code"), "attach", "CLI clients register attach too")
+	assert_eq(McpDockScript._client_transport_tag("hermes"), "attach", "YAML clients included")
+	assert_eq(McpDockScript._client_transport_tag("codex"), "attach",
+		"TOML COMMAND_ARRAY clients tag attach too")
+	assert_eq(McpDockScript._client_transport_tag("cherry_studio"), "URL",
+		"cherry_studio deliberately stays URL-mode (#838 follow-up)")
+	assert_eq(McpDockScript._client_transport_tag("__missing_client__"), "")

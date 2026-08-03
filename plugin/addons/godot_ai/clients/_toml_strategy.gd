@@ -53,7 +53,7 @@ static func configure(
 		output_fresh.append_array(new_lines)
 		if not McpAtomicWrite.write(path, "\n".join(output_fresh)):
 			return {"status": "error", "message": "Cannot write to %s" % path}
-		return {"status": "ok", "message": "%s configured" % client.display_name}
+		return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 
 	var old_items := _value_items(lines, int(section["start"]) + 1, int(section["end"]))
 	var old_by_key := {}
@@ -99,7 +99,7 @@ static func configure(
 
 	if not McpAtomicWrite.write(path, "\n".join(output)):
 		return {"status": "error", "message": "Cannot write to %s" % path}
-	return {"status": "ok", "message": "%s configured" % client.display_name}
+	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 
 
 static func check_status(

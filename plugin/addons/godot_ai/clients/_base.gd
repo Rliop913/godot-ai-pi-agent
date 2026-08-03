@@ -37,6 +37,17 @@ static func status_label(status: McpClient.Status) -> String:
 			return "configured_mismatch"
 	return "error"
 
+
+## One-line configure success message, shared by every strategy so the dock
+## and the `client_manage` tool describe the transport that was actually
+## written. Command-shape clients register the stdio `godot-ai attach`
+## bridge — the URL-era "(HTTP: <url>)" suffix would name a transport the
+## write never touched (found live in the #838 Windows smoke).
+static func configured_message(client: McpClient, server_url: String) -> String:
+	if client.command_shape != CommandShape.NONE:
+		return "%s configured (stdio attach)" % client.display_name
+	return "%s configured (HTTP: %s)" % [client.display_name, server_url]
+
 var id: String = ""                              ## stable key, e.g. "cursor"
 var display_name: String = ""                    ## "Cursor"
 var config_type: String = ""                     ## "json" | "toml" | "yaml" | "cli"
@@ -62,8 +73,9 @@ var path_template: Dictionary = {}
 ##   3. Multiple matches within any wildcard group are ambiguous and fail
 ##      closed instead of choosing an arbitrary package.
 ##
-## `config_home_override` still has higher priority. When this map has no entry
-## for the current platform, `path_template` remains the fallback.
+## Exact-file and config-home environment overrides still have higher
+## priority. When this map has no entry for the current platform,
+## `path_template` remains the fallback.
 var config_path_candidates: Dictionary = {}
 
 ## De-duplicate persistent path-ambiguity warnings across recurring status
@@ -104,12 +116,28 @@ var entry_extra_fields: Dictionary = {}
 ## restores that contract under the data-only descriptor model.
 var entry_initial_fields: Dictionary = {}
 
-## Client-owned stdio launch shape.
+## Client-owned stdio launch shape. Each strategy renders the shape in its
+## config language:
 ##
-## COMMAND_ARRAY is consumed by the TOML strategy and FLAT by the JSON
-## strategy. The remaining values are shared vocabulary for later JSON, YAML,
-## and CLI migrations; keeping them data-only avoids reintroducing the
-## descriptor Callable race from #229.
+## - FLAT — `command` string + `args` array as sibling keys. JSON and YAML
+##   strategies. A client whose docs require a type discriminator next to the
+##   flat keys (VS Code's `type: "stdio"`, Claude Code's fallback file) stays
+##   FLAT and declares it via `command_transport_key` / `command_transport_value`,
+##   so TYPED_FLAT remains reserved vocabulary.
+## - COMMAND_ARRAY — the launch argv carried as one array. In the JSON
+##   strategy the entry's `command` field IS that array (OpenCode's
+##   `"command": ["uvx", …]`). In the TOML strategy the launcher renders as a
+##   `command = "…"` line plus an `args = […]` array (Codex, Grok) — the name
+##   refers to the argv-as-TOML-array body it emits.
+## - NESTED_COMMAND — command/args nested inside a sub-object. Reserved; no
+##   current client needs it and strategies reject it with an actionable error.
+##
+## CLI-registered clients (`config_type == "cli"`) express the launch through
+## `cli_register_template` tokens instead; their `command_shape` governs the
+## JSON-fallback file rendering (Claude Code, #463).
+##
+## Values are data-only shared vocabulary; keeping them data-only avoids
+## reintroducing the descriptor Callable race from #229.
 enum CommandShape { NONE, FLAT, TYPED_FLAT, COMMAND_ARRAY, NESTED_COMMAND }
 var command_shape: CommandShape = CommandShape.NONE
 
@@ -146,11 +174,18 @@ var command_timeout_fields: PackedStringArray = PackedStringArray()
 
 ## Paths whose existence implies the user has this client installed.
 ## Used purely for the dock's "installed" badge. `is_installed()` additionally
-## checks `resolved_config_path()`, so a config relocated via
-## `config_home_env` is detected without listing it here.
+## checks `resolved_config_path()`, so a config relocated via an environment
+## override is detected without listing it here.
 var detect_paths: PackedStringArray = PackedStringArray()
 
-# Config-home env override ---------------------------------------------------
+# Config-path env overrides --------------------------------------------------
+## Some clients name the exact config file in an environment variable
+## (OpenCode: `$OPENCODE_CONFIG`). When the variable is set and non-empty, it
+## wins over directory-valued `config_home_env` and `path_template`. Relative
+## values fail closed because the editor and client may have different working
+## directories; auto-configuration cannot safely assume they resolve alike.
+var config_file_env: String = ""
+
 ## Some clients honor an env var that relocates their entire config home
 ## (Codex: `$CODEX_HOME/config.toml`; Claude Code: `$CLAUDE_CONFIG_DIR/.claude.json`).
 ## When `config_home_env` names an env var that is set and non-empty,
@@ -169,7 +204,10 @@ var config_home_env_subpath: String = ""
 var cli_names: PackedStringArray = PackedStringArray()
 ## Argument templates with `{name}` and `{url}` tokens; the strategy
 ## substitutes them at call time. Tokens are matched verbatim — no escaping
-## semantics, no shell expansion. Populated by CLI descriptors (`claude_code`, `kimi_code`).
+## semantics, no shell expansion. Command-shape templates additionally use the
+## whole-element tokens `{command}` / `{args...}` (see `McpCliStrategy.format_args`).
+## Populated by CLI descriptors (currently `claude_code`; `kimi_code` moved to
+## mcp.json in #813).
 var cli_register_template: PackedStringArray = PackedStringArray()
 var cli_unregister_template: PackedStringArray = PackedStringArray()
 ## Args run to read current state; stdout is scanned for the server name and
@@ -187,10 +225,10 @@ var toml_legacy_section_aliases: PackedStringArray = PackedStringArray()
 var toml_body_template: PackedStringArray = PackedStringArray()
 
 
-## Resolved absolute config path for this client on the current OS.
-## A set, non-empty `config_home_env` env var overrides `path_template`
-## (issue #617: e.g. CODEX_HOME relocates ~/.codex — writing the default
-## path would false-succeed while Codex reads elsewhere).
+## Resolved absolute config path for this client on the current OS. Exact-file
+## overrides win first, followed by directory-valued `config_home_env`, then
+## ordered candidates / `path_template`. Ignoring either override can write a
+## file the client never reads and false-succeed.
 func resolved_config_path() -> String:
 	return str(resolved_config_path_details().get("path", ""))
 
@@ -200,6 +238,10 @@ func resolved_config_path() -> String:
 ## is empty for ordinary unsupported/missing path mappings to preserve the
 ## long-standing status behavior for clients not installed on this platform.
 func resolved_config_path_details() -> Dictionary:
+	var file_override := config_file_override_details()
+	if not str(file_override.get("path", "")).is_empty() or not str(file_override.get("error", "")).is_empty():
+		_clear_config_path_warning()
+		return file_override
 	var override := config_home_override()
 	if not override.is_empty():
 		_clear_config_path_warning()
@@ -209,6 +251,33 @@ func resolved_config_path_details() -> Dictionary:
 		return _resolve_ordered_config_path_candidates(config_path_candidates[candidate_key])
 	_clear_config_path_warning()
 	return {"path": McpPathTemplate.resolve(path_template), "error": ""}
+
+
+## The exact-file env override plus any fail-closed diagnostic. Empty path and
+## error means no override applies (no mapping, unset, or blank env var).
+func config_file_override_details() -> Dictionary:
+	if config_file_env.is_empty():
+		return {"path": "", "error": ""}
+	## env_lookup, not OS.get_environment: this can run on dock workers (#691).
+	var raw_path := McpPathTemplate.env_lookup(config_file_env).strip_edges()
+	if raw_path.is_empty():
+		return {"path": "", "error": ""}
+	var expanded := McpPathTemplate.expand(raw_path)
+	if not expanded.is_absolute_path():
+		return {
+			"path": "",
+			"error": "%s's $%s override must be an absolute config-file path; got %s" % [
+				display_name, config_file_env, raw_path,
+			],
+		}
+	if DirAccess.dir_exists_absolute(expanded):
+		return {
+			"path": "",
+			"error": "%s's $%s override must point to a config file, not a directory: %s" % [
+				display_name, config_file_env, expanded,
+			],
+		}
+	return {"path": expanded, "error": ""}
 
 
 func _resolve_ordered_config_path_candidates(templates: Variant) -> Dictionary:

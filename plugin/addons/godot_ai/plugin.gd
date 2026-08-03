@@ -1127,6 +1127,14 @@ func get_server_status() -> Dictionary:
 	return _lifecycle.get_status_dict()
 
 
+## Diagnostic accessor for the dock's ownership label. Positive = a PID this
+## plugin instance spawned (or re-acquired via the managed record); -1 = an
+## adopted external/attach-owned backend. Display only — adoption transfers
+## end-of-life responsibility, so this value is never kill proof (#669).
+func get_server_pid() -> int:
+	return _lifecycle.get_server_pid()
+
+
 func get_resolved_ws_port() -> int:
 	return _resolved_ws_port
 

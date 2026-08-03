@@ -17,6 +17,11 @@ const TEST_FILE_CONTENT := "Hello from MCP test\nLine 2\nLine 3\n"
 ## logged) while still exercising the sidecar-based classification.
 const IMPORTED_ASSET_PATH := "res://tests/_mcp_test_imported.dat"
 
+## Scratch script specimen for the mixed-batch reimport test. Written and
+## removed by the test itself; listed in teardown as a safety net for an
+## aborted run.
+const SCRATCH_SCRIPT_PATH := "res://tests/_mcp_test_scratch_script.gd"
+
 
 func suite_name() -> String:
 	return "filesystem"
@@ -44,7 +49,7 @@ func suite_teardown() -> void:
 	var written_path := "res://tests/_mcp_test_written.txt"
 	if FileAccess.file_exists(written_path):
 		DirAccess.remove_absolute(written_path)
-	for path in [IMPORTED_ASSET_PATH, IMPORTED_ASSET_PATH + ".import"]:
+	for path in [IMPORTED_ASSET_PATH, IMPORTED_ASSET_PATH + ".import", SCRATCH_SCRIPT_PATH]:
 		if FileAccess.file_exists(path):
 			DirAccess.remove_absolute(path)
 
@@ -286,10 +291,22 @@ func test_reimport_mixed_batch_splits_the_report() -> void:
 	## The case #778 is about: one imported asset, one script, one missing
 	## path in a single call. Each lands in its own bucket, and the script
 	## never counts as reimported.
-	var script_path := "res://addons/godot_ai/handlers/filesystem_handler.gd"
+	##
+	## The script specimen is a scratch fixture, never a live plugin script:
+	## reimport() runs `efs.update_file()` on each path, and pointing that at
+	## the handler's own script hot-reloads code that is on the call stack —
+	## "Bad address index" script errors in a GUI editor, then a signal-11
+	## editor crash on repeated runs (the #229-class reload race; found
+	## during the #838 Windows verification).
+	var script_path := SCRATCH_SCRIPT_PATH
+	var scratch := FileAccess.open(script_path, FileAccess.WRITE)
+	assert_true(scratch != null, "scratch script fixture must be writable")
+	scratch.store_string("extends RefCounted\n## reimport specimen; never loaded by anything\n")
+	scratch.close()
 	var result := _handler.reimport({
 		"paths": [IMPORTED_ASSET_PATH, script_path, "res://nonexistent.png"],
 	})
+	DirAccess.remove_absolute(script_path)
 	assert_has_key(result, "data")
 	assert_eq(result.data.reimported, [IMPORTED_ASSET_PATH])
 	assert_eq(result.data.skipped_non_imported, [script_path])

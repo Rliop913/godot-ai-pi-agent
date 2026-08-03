@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import httpx
@@ -115,6 +116,38 @@ async def test_run_attach_wires_ensure_observer_proxy_and_lease(monkeypatch) -> 
     assert ("proxy", "http://127.0.0.1:8123/mcp") in events
     assert ("run", "stdio", False) in events
     assert events[-1] == "close"
+
+
+def test_disable_telemetry_flag_sets_env_for_bridge_and_backend(monkeypatch) -> None:
+    """The client entry carries the opt-out as argv; the bridge must translate
+    it back into the env contract telemetry.py honors BEFORE run_attach, so the
+    backend spawn's os.environ copy (ensure._backend_spawn_env) inherits it."""
+
+    seen_env: list[str | None] = []
+
+    async def record(*_args):
+        seen_env.append(os.environ.get("GODOT_AI_DISABLE_TELEMETRY"))
+
+    monkeypatch.setattr(attach_main_module, "run_attach", record)
+    monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
+
+    attach_main_module.main(["--disable-telemetry"])
+
+    assert seen_env == ["true"]
+
+
+def test_without_disable_telemetry_flag_env_stays_unset(monkeypatch) -> None:
+    seen_env: list[str | None] = []
+
+    async def record(*_args):
+        seen_env.append(os.environ.get("GODOT_AI_DISABLE_TELEMETRY"))
+
+    monkeypatch.setattr(attach_main_module, "run_attach", record)
+    monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
+
+    attach_main_module.main([])
+
+    assert seen_env == [None]
 
 
 def test_invalid_exclude_domains_use_parser_error(monkeypatch, capsys) -> None:

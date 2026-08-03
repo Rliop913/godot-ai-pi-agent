@@ -94,13 +94,16 @@ Kimi Code.
 
 </details>
 
-Most clients connect to `http://127.0.0.1:8000/mcp`. Claude Desktop and Codex
-are configured with the client-owned `godot-ai attach` stdio bridge instead,
-so they can discover the tools before Godot opens and keep using them across
-same-version editor restarts. If auto-configure can't find a compatible local
-launcher, each dock row exposes a **Run this manually** panel with a copyable
-snippet. Clients whose native configuration supports URL transport also show
-an advanced URL fallback.
+Nearly every client is configured with the client-owned `godot-ai attach`
+stdio bridge: the client launches a local command that starts or adopts the
+shared HTTP backend, so tools are discoverable before Godot opens and keep
+working across same-version editor restarts. Each dock row carries an
+`attach` / `URL` tag naming which transport Configure writes. If
+auto-configure can't find a compatible local launcher, the row exposes a
+**Run this manually** panel with a copyable snippet, and clients whose native
+configuration supports URL transport also show an advanced URL fallback.
+(Cherry Studio intentionally stays URL-mode — its MCP servers are managed
+inside the app, not via an external config file.)
 
 ### 4. Try it
 
@@ -203,9 +206,19 @@ running when the client starts, a client restart may still be required.
 **Grok Build** (`~/.grok/config.toml`)
 
 ```toml
-[mcp_servers.godot-ai]
-url = "http://127.0.0.1:8000/mcp"
-enabled = true
+[mcp_servers."godot-ai"]
+command = "/absolute/path/to/uvx"
+args = [
+  "--link-mode",
+  "copy",
+  "--from",
+  "godot-ai==VERSION",
+  "godot-ai",
+  "attach",
+  "--port", "8000",
+  "--ws-port", "9500",
+]
+startup_timeout_sec = 60
 ```
 
 Or dock → **Clients** → **Grok Build** → **Configure**.
@@ -216,7 +229,8 @@ Or dock → **Clients** → **Grok Build** → **Configure**.
 {
   "mcpServers": {
     "godot-ai": {
-      "serverUrl": "http://127.0.0.1:8000/mcp",
+      "command": "/absolute/path/to/uvx",
+      "args": ["--link-mode", "copy", "--from", "godot-ai==VERSION", "godot-ai", "attach", "--port", "8000", "--ws-port", "9500"],
       "disabled": false
     }
   }
