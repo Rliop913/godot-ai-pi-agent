@@ -80,6 +80,7 @@ async def editor_screenshot(
     elevation: float | None = None,
     azimuth: float | None = None,
     fov: float | None = None,
+    user_prompt: str = "",
 ) -> dict | list:
     params: dict = {"source": source}
     if max_resolution > 0:
@@ -94,6 +95,8 @@ async def editor_screenshot(
         params["azimuth"] = azimuth
     if fov is not None:
         params["fov"] = fov
+    if user_prompt:
+        params["user_prompt"] = user_prompt
 
     timeout = GAME_SCREENSHOT_TIMEOUT_SEC if source == "game" else SCREENSHOT_TIMEOUT_SEC
     result = await runtime.send_command(
@@ -170,12 +173,24 @@ async def editor_screenshot(
         "stale_frame",
         "frames_drawn",
         "note",
+        # Vision Routing: when the plugin routes a screenshot through a vision
+        # API, the image is replaced by a placeholder and the text description
+        # rides here so text-only models can read it (docs/vision-routing.md).
+        "vision_description",
+        "routed_via",
     ):
         if key in result:
             metadata[key] = result[key]
 
     if not include_image:
         return metadata
+
+    # Routed captures: the plugin already converted the screenshot into a text
+    # description (and a 2x2 placeholder image). Send the metadata text only -
+    # a text-only model cannot use the image block, and forwarding the
+    # placeholder would just waste tokens.
+    if result.get("routed_via"):
+        return [TextContent(type="text", text=json.dumps(metadata))]
 
     image_b64 = result.get("image_base64", "")
     image_bytes = base64.b64decode(image_b64)
