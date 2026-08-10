@@ -201,6 +201,72 @@ func test_non_windows_launch_shape_stays_direct() -> void:
 	assert_eq(launch.get("args", [])[0], "--link-mode")
 
 
+func test_launch_for_client_unwraps_pythonw_for_opted_out_clients() -> void:
+	## #863: Antigravity hangs stdio tool calls behind a GUI-subsystem
+	## pythonw.exe, so its descriptor opts out of the consoleless launcher and
+	## must receive the plain console command on Windows.
+	var antigravity := McpClientRegistry.get_by_id("antigravity")
+	assert_false(
+		antigravity.needs_consoleless_launcher,
+		"antigravity must opt out of the pythonw launcher (#863)",
+	)
+	var launch := _uvx_launch("audio")
+	assert_eq(launch.get("command"), "C:/Python313/pythonw.exe")
+	var console := McpClientConfigurator.launch_for_client(antigravity, launch)
+	assert_eq(console.get("command"), "C:/Tools/uv/uvx.exe")
+	assert_eq(console.get("args", [])[0], "--link-mode")
+	assert_false(
+		str(console.get("args", [])).contains("creationflags"),
+		"console launch must not carry the pythonw bootstrap",
+	)
+	assert_false(console.has("console_command"), "console keys are internal-only")
+	assert_eq(
+		McpClientConfigurator.launch_for_client(antigravity, console),
+		console,
+		"launch_for_client must be idempotent",
+	)
+
+
+func test_launch_for_client_dev_venv_returns_console_python() -> void:
+	var antigravity := McpClientRegistry.get_by_id("antigravity")
+	var launch := McpClientConfigurator.resolve_attach_launch(
+		_context(),
+		{
+			"venv_python": "C:/repo/.venv/Scripts/python.exe",
+			"uvx_path": "",
+			"system_path": "",
+			"consoleless_python": "C:/repo/.venv/Scripts/pythonw.exe",
+		},
+	)
+	var console := McpClientConfigurator.launch_for_client(antigravity, launch)
+	assert_eq(console.get("command"), "C:/repo/.venv/Scripts/python.exe")
+	assert_eq(console.get("args"), launch.get("args"), "dev tier args are shared verbatim")
+
+
+func test_launch_for_client_keeps_pythonw_for_default_clients() -> void:
+	var codex := McpClientRegistry.get_by_id("codex")
+	assert_true(
+		codex.needs_consoleless_launcher,
+		"codex needs the pythonw launcher — its terminal problem is why it exists (#827)",
+	)
+	var launch := _uvx_launch()
+	var kept := McpClientConfigurator.launch_for_client(codex, launch)
+	assert_eq(kept.get("command"), "C:/Python313/pythonw.exe")
+	assert_eq(kept.get("args"), launch.get("args"))
+
+
+func test_launch_for_client_non_windows_launch_is_untouched() -> void:
+	var antigravity := McpClientRegistry.get_by_id("antigravity")
+	var context := _context()
+	context["platform"] = "Linux"
+	var launch := McpClientConfigurator.resolve_attach_launch(
+		context,
+		{"venv_python": "", "uvx_path": "/home/agent/.local/bin/uvx", "system_path": ""},
+	)
+	assert_false(launch.has("console_command"), "non-Windows launches carry no console shape")
+	assert_eq(McpClientConfigurator.launch_for_client(antigravity, launch), launch)
+
+
 func test_launch_context_values_are_worker_safe_and_exclusions_are_canonical() -> void:
 	var canonical_domains := McpClientConfigurator._canonicalize_excluded_domains(
 		" particle, audio,particle,unknown "

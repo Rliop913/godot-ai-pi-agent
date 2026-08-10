@@ -190,7 +190,10 @@ tiers, a small stdio-preserving `CREATE_NO_WINDOW` bootstrap). This prevents a
 terminal window from opening with Claude Desktop or Codex while keeping the MCP
 process attached to the client's stdin/stdout pipes. Do not simplify that
 generated entry back to a console-subsystem `python.exe`, `uvx.exe`, or
-`godot-ai.exe` command.
+`godot-ai.exe` command. Antigravity is the exception: its spawner hangs tool
+calls behind a GUI-subsystem executable (#863), so its entry is written with
+the plain console command instead — Antigravity hides child console windows
+itself.
 
 Advanced fallback for clients intentionally kept in URL mode:
 
