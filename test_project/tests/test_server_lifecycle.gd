@@ -95,6 +95,17 @@ class _ManagerHostStub extends GodotAiPlugin:
 		return managed_pid_lookup
 
 
+## Host for the deferred-walk (#678) verdict-race test below: a worker-side
+## nap keeps the startup walk deterministically suspended inside its first
+## `_run_blocking` op (without it a fast worker can finish before the first
+## `is_alive()` check and the whole walk completes without suspending). The
+## nap runs on the worker thread, never the main thread.
+class _SuspendedWalkHostStub extends _ManagerHostStub:
+	func _is_port_in_use(port: int) -> bool:
+		OS.delay_msec(100)
+		return super._is_port_in_use(port)
+
+
 const TEST_PORT := 65431
 
 const _TENV1 := "GODOT_AI_DISABLE_TELEMETRY"
@@ -273,6 +284,61 @@ func test_set_incompatible_server_tolerates_missing_connection() -> void:
 	var state := manager.get_state()
 	host.free()
 
+	assert_eq(state, McpServerState.INCOMPATIBLE)
+
+
+# ----- sync verdict vs suspended startup walk (worker-slot ownership) ---
+
+func test_sync_verdict_mid_walk_cancels_walk_before_claiming_worker_slot() -> void:
+	## An incompatible-occupant startup walk suspends in _run_blocking
+	## while the WS handshake verdict (McpServerVersionCheck, ticked from
+	## the plugin's _process) can land handle_server_version_verified
+	## concurrently. The verdict's _set_incompatible_server tail claims
+	## the single active-worker slot, so it must cancel the suspended walk
+	## first — pre-fix it stole the slot instead, the walk's op lost the
+	## _invalidate_async_startup join guarantee, and the walk's resume got
+	## a null with no generation bump ("Trying to assign value of type
+	## 'Nil' to a variable of type 'Dictionary'" on v3.1.2/v3.1.3 startup
+	## against an older attach-owned server holding the port).
+	##
+	## The runner does not await test coroutines, so this test makes only
+	## synchronous observations: everything asserted below is latched
+	## before _set_incompatible_server's first await. The closing
+	## _invalidate_async_startup joins the tail's in-flight worker and
+	## stales the detached walk/tail continuations, so they unwind on
+	## later frames without touching the freed host.
+	var saved_guard: bool = GodotAiPlugin._server_started_this_session
+	GodotAiPlugin._server_started_this_session = false
+	var host := _SuspendedWalkHostStub.new()
+	host._log_buffer = McpLogBuffer.new()
+	host._connection = null
+	host.port_in_use = true
+	host.live_status = {"name": "godot-ai", "version": "0.0.1", "ws_port": 9500, "status_code": 200}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager.defer_blocking_work = true
+
+	manager.start_server()
+	var walk_suspended: bool = manager._active_blocking_thread != null
+	var in_flight_before: bool = manager._start_in_flight
+	var gen_before := int(manager._async_generation)
+
+	manager.handle_server_version_verified("9.9.9", "0.0.1")
+	var gen_after := int(manager._async_generation)
+	var in_flight_after: bool = manager._start_in_flight
+	var state := manager.get_state()
+
+	manager._invalidate_async_startup()
+	GodotAiPlugin._server_started_this_session = saved_guard
+	host.free()
+
+	assert_true(walk_suspended,
+		"precondition: the deferred walk must be suspended in _run_blocking")
+	assert_true(in_flight_before,
+		"precondition: the suspended walk must hold the re-entrancy guard")
+	assert_gt(gen_after, gen_before,
+		"sync verdict must invalidate the suspended walk before its tail claims the worker slot")
+	assert_false(in_flight_after,
+		"cancelling the walk must release its re-entrancy guard")
 	assert_eq(state, McpServerState.INCOMPATIBLE)
 
 
