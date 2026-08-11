@@ -61,6 +61,7 @@ def test_run_with_reload_uses_uvicorn_factory(monkeypatch):
     monkeypatch.setenv(asgi.DEV_TRANSPORT_ENV, "")
     monkeypatch.setenv(asgi.DEV_WS_PORT_ENV, "")
     monkeypatch.setenv(asgi.DEV_EXCLUDE_DOMAINS_ENV, "")
+    monkeypatch.delenv(asgi.HTTP_ACCESS_LOG_ENV, raising=False)
     monkeypatch.setattr(asgi.uvicorn, "run", fake_run)
 
     asgi.run_with_reload(
@@ -76,6 +77,7 @@ def test_run_with_reload_uses_uvicorn_factory(monkeypatch):
         "host": fastmcp.settings.host,
         "port": 8123,
         "log_level": fastmcp.settings.log_level.lower(),
+        "access_log": False,
         "timeout_graceful_shutdown": 2,
         "lifespan": "on",
         "ws": "websockets-sansio",
@@ -125,6 +127,7 @@ def test_main_runs_server_directly_without_reload(monkeypatch):
         return server
 
     monkeypatch.delenv("GODOT_AI_OWNER_PID", raising=False)
+    monkeypatch.delenv(asgi.HTTP_ACCESS_LOG_ENV, raising=False)
     monkeypatch.setattr("godot_ai.server.create_server", fake_create_server)
 
     godot_ai.main(["--transport", "streamable-http", "--port", "8123", "--ws-port", "9555"])
@@ -132,7 +135,73 @@ def test_main_runs_server_directly_without_reload(monkeypatch):
     assert calls["ws_port"] == 9555
     assert calls["exclude_domains"] == set()
     assert calls["owner_pid"] is None
-    assert server.run_calls == [{"transport": "streamable-http", "port": 8123}]
+    ## Access-log lines default off (uvicorn spams one INFO line per MCP
+    ## call / status probe / lease heartbeat otherwise).
+    assert server.run_calls == [
+        {
+            "transport": "streamable-http",
+            "port": 8123,
+            "uvicorn_config": {"access_log": False},
+        }
+    ]
+
+
+def test_main_enables_access_log_when_env_truthy(monkeypatch):
+    server = StubServer(app=None)
+
+    monkeypatch.delenv("GODOT_AI_OWNER_PID", raising=False)
+    monkeypatch.setenv(asgi.HTTP_ACCESS_LOG_ENV, "1")
+    monkeypatch.setattr(
+        "godot_ai.server.create_server",
+        lambda ws_port, *, exclude_domains=None, owner_pid=None, allow_host_networks=None: server,
+    )
+
+    godot_ai.main(["--transport", "streamable-http", "--port", "8123", "--ws-port", "9555"])
+
+    assert server.run_calls == [
+        {
+            "transport": "streamable-http",
+            "port": 8123,
+            "uvicorn_config": {"access_log": True},
+        }
+    ]
+
+
+def test_run_with_reload_enables_access_log_when_env_truthy(monkeypatch):
+    calls: dict[str, object] = {}
+
+    monkeypatch.setenv(asgi.DEV_TRANSPORT_ENV, "")
+    monkeypatch.setenv(asgi.DEV_WS_PORT_ENV, "")
+    monkeypatch.setenv(asgi.DEV_EXCLUDE_DOMAINS_ENV, "")
+    monkeypatch.setenv(asgi.HTTP_ACCESS_LOG_ENV, "true")
+    monkeypatch.setattr(asgi.uvicorn, "run", lambda app, **kwargs: calls.update(kwargs))
+
+    asgi.run_with_reload(transport="streamable-http", port=8123, ws_port=9555)
+
+    assert calls["access_log"] is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", False),
+        ("0", False),
+        ("false", False),
+        ("off", False),
+        ("1", True),
+        ("true", True),
+        (" YES ", True),
+        ("On", True),
+    ],
+)
+def test_http_access_log_enabled_truthiness(monkeypatch, value, expected):
+    monkeypatch.setenv(asgi.HTTP_ACCESS_LOG_ENV, value)
+    assert asgi.http_access_log_enabled() is expected
+
+
+def test_http_access_log_disabled_when_env_absent(monkeypatch):
+    monkeypatch.delenv(asgi.HTTP_ACCESS_LOG_ENV, raising=False)
+    assert asgi.http_access_log_enabled() is False
 
 
 def test_main_forwards_exclude_domains_to_create_server(monkeypatch):

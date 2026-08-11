@@ -171,6 +171,10 @@ def test_main_plumbs_pid_file_into_runtime_info(monkeypatch, tmp_path):
     monkeypatch.setattr("godot_ai.server.create_server", _fake_create_server)
 
     import godot_ai
+    from godot_ai import asgi
+
+    ## Hermetic against an inherited GODOT_AI_HTTP_ACCESS_LOG in the test env.
+    monkeypatch.delenv(asgi.HTTP_ACCESS_LOG_ENV, raising=False)
 
     godot_ai.main(
         [
@@ -186,4 +190,8 @@ def test_main_plumbs_pid_file_into_runtime_info(monkeypatch, tmp_path):
     )
 
     assert captured["path"] == str(pid_path)
-    assert captured["run_kwargs"] == {"transport": "streamable-http", "port": 8123}
+    assert captured["run_kwargs"] == {
+        "transport": "streamable-http",
+        "port": 8123,
+        "uvicorn_config": {"access_log": False},
+    }

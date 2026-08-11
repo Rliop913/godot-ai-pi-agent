@@ -20,7 +20,16 @@ DEV_EXCLUDE_DOMAINS_ENV = "GODOT_AI_DEV_EXCLUDE_DOMAINS"
 ## ``create_app`` factory, so --allow-host CIDRs ride through as an env var
 ## (the comma-joined CIDR strings) rather than a function argument.
 DEV_ALLOW_HOST_ENV = "GODOT_AI_DEV_ALLOW_HOST"
+## Uvicorn's per-request access log (`INFO: 127.0.0.1:... "POST /mcp" 200 OK`)
+## is opt-in: a local MCP server serves constant tool calls, status probes,
+## and lease heartbeats, so the default-on access log drowns the lines that
+## matter in the editor console. Set to 1/true/yes/on to re-enable.
+HTTP_ACCESS_LOG_ENV = "GODOT_AI_HTTP_ACCESS_LOG"
 RELOADABLE_TRANSPORTS = {"sse", "streamable-http"}
+
+
+def http_access_log_enabled() -> bool:
+    return os.environ.get(HTTP_ACCESS_LOG_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 STALE_MCP_SESSION_MESSAGE = (
     "MCP session expired or was not found; reinitialize the streamable HTTP session"
@@ -207,6 +216,7 @@ def run_with_reload(
         host=bind_host,
         port=port,
         log_level=fastmcp.settings.log_level.lower(),
+        access_log=http_access_log_enabled(),
         timeout_graceful_shutdown=2,
         lifespan="on",
         ws="websockets-sansio",

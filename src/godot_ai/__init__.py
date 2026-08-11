@@ -272,6 +272,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     transport_kwargs = {}
     if args.transport in ("sse", "streamable-http"):
+        from godot_ai.asgi import http_access_log_enabled
+
         transport_kwargs["port"] = args.port
+        ## Per-request access-log lines are opt-in (GODOT_AI_HTTP_ACCESS_LOG);
+        ## see the rationale on HTTP_ACCESS_LOG_ENV in asgi.py. FastMCP still
+        ## sets uvicorn's log_level itself — this dict carries neither
+        ## `log_level` nor `log_config`, which would suppress that default.
+        transport_kwargs["uvicorn_config"] = {"access_log": http_access_log_enabled()}
 
     server.run(transport=args.transport, **transport_kwargs)
