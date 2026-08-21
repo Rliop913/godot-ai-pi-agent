@@ -249,6 +249,8 @@ func test_pi_client_json_descriptor() -> void:
 		"$USERPROFILE/.pi/agent/mcp.json",
 		"Pi config path must use $USERPROFILE on Windows"
 	)
+	assert_true(client.detect_paths.has("~/.pi/agent/mcp.json"))
+	assert_true(client.detect_paths.has("$USERPROFILE/.pi/agent/mcp.json"))
 	assert_eq(client.server_key_path.size(), 1)
 	assert_eq(String(client.server_key_path[0]), "mcpServers")
 	assert_eq(client.entry_url_field, "url")
@@ -262,6 +264,10 @@ func test_pi_client_json_descriptor() -> void:
 	assert_true(
 		client.command_supports_url_fallback,
 		"Pi's loader accepts URL entries too — manual-instruction fallback must stay"
+	)
+	assert_true(
+		client.command_transport_key.is_empty(),
+		"Pi must not declare a transport discriminator"
 	)
 	assert_true(
 		client.command_transport_value == null or str(client.command_transport_value) == "",

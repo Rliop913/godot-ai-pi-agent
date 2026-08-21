@@ -72,7 +72,7 @@ await readResource("godot-ai", "godot://scene/current");
 Do not call `godot-ai/editor_state`, `godot-ai/get_editor_state`, or
 `godot-ai/get_current_scene`. The `godot-ai/` prefix does not belong in the
 second argument, and the `get_*` forms are not registered tools. Use
-`list_mcp_tools("editor_state")` when unsure of the current catalog name.
+`listTools("editor_state")` when unsure of the current catalog name.
 - **CLI** — `cli_register_template` uses the whole-element tokens
   `{command}` / `{args...}` (Claude Code:
   `mcp add --scope user {name} -- {command} {args...}`). Status for
