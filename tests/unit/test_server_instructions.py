@@ -6,8 +6,7 @@ set was computed — an excluded tool read as a discovery failure instead of
 a configuration. These tests pin:
 
   - byte-identity of the no-exclusion output against a frozen snapshot of
-    the pre-#772 static text (the refactor must not change what unexcluded
-    servers advertise);
+    the current intentional capability guidance;
   - omission of excluded domains' named verbs and rollup lines, plus the
     trailing "Excluded domains" section;
   - the named-verb count in the header against live registration, for
@@ -25,9 +24,9 @@ import pytest
 from godot_ai.server import build_instructions, create_server
 from godot_ai.tools._meta_tool import MANAGE_TOOL_HANDLERS
 
-## Frozen copy of the static instructions text as shipped before #772
-## (main @ 04fdfd8). build_instructions(set()) must reproduce it byte for
-## byte — if this fails, the no-exclusion capability surface changed.
+## Frozen copy of the intentional no-exclusion instructions. Update this only
+## when capability guidance changes deliberately; accidental drift must fail
+## loudly.
 _FROZEN_NO_EXCLUSION_TEXT = (
     "Production-grade Godot MCP server with persistent editor integration.\n\n"
     "Tool surface — 19 named verbs + per-domain `<domain>_manage` rollups:\n\n"
@@ -94,6 +93,11 @@ _FROZEN_NO_EXCLUSION_TEXT = (
     "  godot://script/{path}, godot://project/info, godot://project/settings,\n"
     "  godot://materials, godot://input_map, godot://performance,\n"
     "  godot://test/results\n\n"
+    "Code-mode adapters keep server and member names separate: "
+    "call('godot-ai', 'editor_state', {}) and "
+    "readResource('godot-ai', 'godot://scene/current'). Never prefix the "
+    "second argument with 'godot-ai/' and do not invent legacy names such as "
+    "get_editor_state or get_current_scene.\n\n"
     "Always connect to an editor session first (session_activate or "
     'session_manage(op="list")). Write operations require session readiness; '
     "check editor_state if a call is rejected as 'not writable'. After driving a "
@@ -105,6 +109,29 @@ _FROZEN_NO_EXCLUSION_TEXT = (
 def _registered_tools(exclude: set[str] | None = None) -> set[str]:
     server = create_server(exclude_domains=exclude)
     return {t.name for t in asyncio.run(server.list_tools())}
+
+
+def _registered_tool(name: str):
+    server = create_server()
+    return next(tool for tool in asyncio.run(server.list_tools()) if tool.name == name)
+
+
+def test_editor_state_description_teaches_code_mode_call_signature():
+    description = _registered_tool("editor_state").description
+
+    assert "call('godot-ai', 'editor_state', {})" in description
+    assert "readResource('godot-ai', 'godot://scene/current')" in description
+    assert "godot-ai/get_editor_state" in description
+
+
+def test_scene_and_node_descriptions_explain_persistence_and_subresources():
+    scene_description = _registered_tool("scene_manage").description
+    node_description = _registered_tool("node_set_property").description
+
+    assert "later node_create/node_set_property mutations remain" in scene_description
+    assert "until scene_save or save_as is called" in scene_description
+    assert "[sub_resource]" in node_description
+    assert '"resource_path": "res://meshes/box.tres"' in node_description
 
 
 # --- byte-identity with no exclusions ---

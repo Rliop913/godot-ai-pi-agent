@@ -640,6 +640,7 @@ func test_registry_wide_attach_shape_declarations() -> void:
 		"opencode": [McpClient.CommandShape.COMMAND_ARRAY, "local", ["url", "headers"]],
 		"grok": [McpClient.CommandShape.COMMAND_ARRAY, null, ["url", "headers"]],
 		"hermes": [McpClient.CommandShape.FLAT, null, ["url", "headers"]],
+		"pi": [McpClient.CommandShape.FLAT, null, ["url", "headers", "type"]],
 		## cherry_studio deliberately stays URL-mode: its mcp_servers.json is
 		## not read by the app at all (SQLite-backed) — see #838 follow-up.
 		"cherry_studio": [McpClient.CommandShape.NONE, null, []],

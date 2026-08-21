@@ -50,7 +50,7 @@ func test_registry_loads_all_clients() -> void:
 	var ids := McpClientRegistry.ids()
 	assert_gt(ids.size(), 10, "Expected at least 10 registered clients, got %d" % ids.size())
 	# Each existing client must remain registered for behaviour parity.
-	for required in ["claude_code", "claude_desktop", "codex", "grok", "antigravity", "zoo_code", "hermes"]:
+	for required in ["claude_code", "claude_desktop", "codex", "grok", "antigravity", "zoo_code", "hermes", "pi"]:
 		assert_true(McpClientRegistry.has_id(required), "Missing client: %s" % required)
 
 
@@ -222,6 +222,56 @@ func test_kimi_code_client_json_descriptor() -> void:
 	assert_eq(client.server_key_path.size(), 1)
 	assert_eq(String(client.server_key_path[0]), "mcpServers")
 	assert_eq(client.entry_extra_fields.get("transport"), "http")
+
+
+func test_pi_client_json_descriptor() -> void:
+	## Regression guard: pi uses the `pi-codemode-mcp` extension to talk to
+	## MCP servers, which reads definitions from ~/.pi/agent/mcp.json (first
+	## merge tier; ~/.pi/agent/.mcp.json, .pi/mcp.json, .mcp.json merge after).
+	## Documented at github.com/mitsuhiko/pi-codemode-mcp README "Configuration
+	## files" section. There is no `pi mcp add` subcommand — earlier JSON-shape
+	## descriptors that called one failed silently with "unknown subcommand",
+	## and a CLI-shape descriptor would have the same fate. Pin the JSON shape
+	## so a future revert reintroduces the failure loudly here instead of at
+	## Configure time. Transport is inferred from key presence (command vs
+	## url), so `command_transport_key` MUST stay unset — pinning a type
+	## discriminator would hand pi-codemode-mcp an entry it routes wrongly.
+	var client := McpClientRegistry.get_by_id("pi")
+	assert_true(client != null, "pi must remain registered")
+	assert_eq(client.config_type, "json")
+	assert_eq(
+		String(client.path_template.get("unix", "")),
+		"~/.pi/agent/mcp.json",
+		"Pi config path must be ~/.pi/agent/mcp.json"
+	)
+	assert_eq(
+		String(client.path_template.get("windows", "")),
+		"$USERPROFILE/.pi/agent/mcp.json",
+		"Pi config path must use $USERPROFILE on Windows"
+	)
+	assert_eq(client.server_key_path.size(), 1)
+	assert_eq(String(client.server_key_path[0]), "mcpServers")
+	assert_eq(client.entry_url_field, "url")
+	assert_eq(client.command_shape, McpClient.CommandShape.FLAT)
+	var expected_legacy := PackedStringArray(["url", "headers", "type"])
+	assert_eq(client.command_legacy_keys, expected_legacy)
+	assert_true(
+		client.command_user_fields.has("env"),
+		"Pi's command_user_fields must preserve `env`"
+	)
+	assert_true(
+		client.command_supports_url_fallback,
+		"Pi's loader accepts URL entries too — manual-instruction fallback must stay"
+	)
+	assert_true(
+		client.command_transport_value == null or str(client.command_transport_value) == "",
+		"Pi is typeless — any command_transport_value pins a discriminator the loader will route wrongly"
+	)
+	assert_eq(
+		client.entry_initial_fields.size(),
+		0,
+		"Pi documents no seed defaults; entry_initial_fields must stay empty"
+	)
 
 
 func test_descriptors_are_data_only() -> void:

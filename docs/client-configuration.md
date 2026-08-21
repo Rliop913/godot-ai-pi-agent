@@ -1,4 +1,4 @@
-# Client configuration (22 MCP clients)
+# Client configuration (23 MCP clients)
 
 Part of the Godot AI agent guide — see [AGENTS.md](../AGENTS.md) for the always-loaded rules.
 
@@ -7,7 +7,7 @@ The registry + strategy system that auto-configures MCP clients.
 
 ## Client configuration
 
-The plugin auto-configures 22 MCP clients via a registry + strategy system in
+The plugin auto-configures 23 MCP clients via a registry + strategy system in
 `plugin/addons/godot_ai/clients/`. Read that directory for the mechanics; two
 rules are not visible in the code:
 
@@ -18,9 +18,9 @@ rules are not visible in the code:
   expressed declaratively on the descriptor (`entry_url_field`, `entry_extra_fields`,
   `command_shape`, `command_initial_fields`, `command_legacy_keys`,
   `command_supports_url_fallback`, `config_path_candidates`). Adding a client
-  means exactly two things: write
-  `clients/<name>.gd` extending `McpClient`, then append one `preload` to
-  `_registry.gd`. No edits to the dock, the facade, or the strategies.
+  means exactly two things: write `clients/<name>.gd` extending `McpClient`,
+  then append its script path to `_CLIENT_SCRIPT_PATHS` in `_registry.gd`.
+  No edits to the dock, the facade, or the strategies.
 
 MCP tools `client_configure`, `client_remove`, and `client_status` expose this to
 AI clients.
@@ -53,6 +53,26 @@ Per-strategy command rendering (`CommandShape` docs in `_base.gd`):
   (Codex, Grok).
 - **YAML** — FLAT with flow-style `args` (Hermes); `url`/`headers` are the
   legacy keys there because Hermes infers transport from key presence.
+- **JSON, typeless** — Antigravity, Pi Agent: FLAT `command`/`args`/`env`
+  with no `type` discriminator; transport is inferred from key presence
+  (`command` vs `url`), so `url`, `headers`, and any leftover `type` key
+  from a previous http-era entry join `command_legacy_keys` and are
+  scrubbed on reconfigure.
+
+### Pi Agent code-mode call syntax
+
+`pi-codemode-mcp` keeps the MCP server name separate from the tool or resource
+name. Pass bare catalog names in the second argument:
+
+```javascript
+await call("godot-ai", "editor_state", {});
+await readResource("godot-ai", "godot://scene/current");
+```
+
+Do not call `godot-ai/editor_state`, `godot-ai/get_editor_state`, or
+`godot-ai/get_current_scene`. The `godot-ai/` prefix does not belong in the
+second argument, and the `get_*` forms are not registered tools. Use
+`list_mcp_tools("editor_state")` when unsure of the current catalog name.
 - **CLI** — `cli_register_template` uses the whole-element tokens
   `{command}` / `{args...}` (Claude Code:
   `mcp add --scope user {name} -- {command} {args...}`). Status for

@@ -60,6 +60,12 @@ def register_editor_tools(mcp: FastMCP, *, include_non_core: bool = True) -> Non
         Also reachable as ``editor_manage(op="state")`` (same handler) for clients
         that prefer a single rolled-up tool.
 
+        Code-mode MCP adapters keep the server and tool names separate:
+        ``call('godot-ai', 'editor_state', {})``. Never pass a server-prefixed
+        tool name such as ``godot-ai/get_editor_state``; that is neither the
+        adapter's call signature nor a registered tool. For dedicated current-
+        scene data, use ``readResource('godot-ai', 'godot://scene/current')``.
+
         Side effect: refreshes the server's session readiness cache from the
         live editor reply. Useful as a recovery step after a write call is
         rejected as ``EDITOR_NOT_READY (state=playing)`` when you already know

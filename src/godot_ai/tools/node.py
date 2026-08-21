@@ -155,8 +155,13 @@ def register_node_tools(mcp: FastMCP, *, include_non_core: bool = True) -> None:
         - Color: dict {r,g,b,a} or hex string ("#ff0000").
         - NodePath: string ("../Other/Node").
         - Resource: res:// path string (loads + assigns); null/"" clears.
-          For a fresh built-in resource, pass ``{"__class__": "BoxMesh", ...}``.
-          See ``resource_manage(op="create")`` for more control.
+          ``{"__class__": "BoxMesh", ...}`` creates a built-in resource owned
+          by this property. After scene_save it is serialized in-place as a
+          ``[sub_resource]`` inside the .tscn; it is not a reusable .tres.
+          For sharing, first call ``resource_manage(op="create",
+          params={"type": "BoxMesh", "properties": {...},
+          "resource_path": "res://meshes/box.tres"})``, then pass that res://
+          path here (or use resource_manage(op="assign")).
         - StringName: plain string. Array/Dictionary: JSON list/object.
 
         Args:

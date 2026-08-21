@@ -21,8 +21,10 @@ Resource form: ``godot://scene/current`` and ``godot://scene/hierarchy``
 
 Ops:
   • create(path, root_type="Node3D", root_name="")
-        Create a new .tscn with the given root and open it. root_name
-        defaults to filename basename when empty.
+        Create the initial .tscn with the given root and open it. root_name
+        defaults to filename basename when empty. This initial root is written
+        immediately, but later node_create/node_set_property mutations remain
+        in editor memory until scene_save or save_as is called.
   • save_as(path)
         Save the currently edited scene to a new file path.
   • get_roots()
@@ -99,6 +101,9 @@ def register_scene_tools(mcp: FastMCP, *, include_non_core: bool = True) -> None
     @mcp.tool(meta=DEFER_META)
     async def scene_save(ctx: Context, session_id: str = "") -> dict:
         """Save the currently edited scene to disk.
+
+        Node and property mutation tools change the editor's in-memory scene;
+        call this explicitly to persist those mutations to the existing path.
 
         Args:
             session_id: Optional Godot session to target. Empty = active session.
