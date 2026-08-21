@@ -58,6 +58,9 @@ Per-strategy command rendering (`CommandShape` docs in `_base.gd`):
   (`command` vs `url`), so `url`, `headers`, and any leftover `type` key
   from a previous http-era entry join `command_legacy_keys` and are
   scrubbed on reconfigure.
+  Pi also accepts top-level `mcpServers`, `mcp-servers`, and `servers` maps;
+  Configure reuses the first existing map in that precedence order so it does
+  not shadow and deactivate legacy entries.
 
 ### Pi Agent code-mode call syntax
 

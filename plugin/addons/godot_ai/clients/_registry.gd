@@ -101,6 +101,7 @@ static func _instance_is_coherent(inst: Object) -> bool:
 		inst.get("config_path_candidates") is Dictionary
 		and inst.get("config_file_env") is String
 		and inst.get("path_template") is Dictionary
+		and inst.get("server_key_path_aliases") is Array
 	)
 
 

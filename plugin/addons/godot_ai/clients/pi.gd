@@ -17,6 +17,14 @@ func _init() -> void:
 		"windows": "$USERPROFILE/.pi/agent/mcp.json",
 	}
 	server_key_path = PackedStringArray(["mcpServers"])
+	# pi-codemode-mcp resolves these with nullish precedence:
+	# mcpServers ?? mcp-servers ?? servers. Reuse whichever map already exists
+	# so Configure cannot shadow and deactivate the user's existing servers.
+	var aliases: Array[PackedStringArray] = [
+		PackedStringArray(["mcp-servers"]),
+		PackedStringArray(["servers"]),
+	]
+	set("server_key_path_aliases", aliases)
 	entry_url_field = "url"
 	# No transport pin: pi-codemode-mcp infers stdio vs http from key
 	# presence (command vs url). Pinning a `type` discriminator would

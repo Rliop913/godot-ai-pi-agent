@@ -811,6 +811,66 @@ func test_grok_renders_attach_toml_and_preserves_undocumented_enabled() -> void:
 	assert_contains(_read(path), "startup_timeout_sec = 90")
 
 
+func test_pi_json_strategy_preserves_legacy_server_map_aliases() -> void:
+	var launch := _uvx_launch()
+	for alias in ["mcp-servers", "servers"]:
+		var path := _scratch_dir.path_join("pi_%s.json" % alias.replace("-", "_"))
+		var initial := {}
+		initial[alias] = {
+			"existing-server": {"command": "existing-command", "args": []},
+		}
+		_write(path, JSON.stringify(initial))
+		var client := _pi_clone(path)
+		var result := McpJsonStrategy.configure(client, "godot-ai", "http://unused", launch)
+		assert_eq(result.get("status"), "ok", "%s configure: %s" % [alias, result.get("message", "")])
+
+		var written: Dictionary = JSON.parse_string(_read(path))
+		assert_false(
+			written.has("mcpServers"),
+			"Configure must not create mcpServers and shadow the existing %s map" % alias,
+		)
+		var holder: Dictionary = written.get(alias, {})
+		assert_true(holder.has("existing-server"), "%s must preserve unrelated servers" % alias)
+		assert_true(holder.has("godot-ai"), "%s must receive the configured server" % alias)
+		assert_eq(
+			McpJsonStrategy.check_status(client, "godot-ai", "http://unused", launch),
+			McpClient.Status.CONFIGURED,
+			"status must resolve the same %s map" % alias,
+		)
+
+		var removed := McpJsonStrategy.remove(client, "godot-ai")
+		assert_eq(removed.get("status"), "ok", "%s remove: %s" % [alias, removed.get("message", "")])
+		var after_remove: Dictionary = JSON.parse_string(_read(path))
+		var remaining: Dictionary = after_remove.get(alias, {})
+		assert_true(remaining.has("existing-server"), "%s remove must preserve unrelated servers" % alias)
+		assert_false(remaining.has("godot-ai"), "%s remove must target the configured map" % alias)
+		assert_false(after_remove.has("mcpServers"), "%s remove must not create the canonical map" % alias)
+
+
+func _pi_clone(path: String) -> McpClient:
+	var registered := McpClientRegistry.get_by_id("pi")
+	var client := McpClient.new()
+	client.id = "pi_test"
+	client.display_name = "Pi Test"
+	client.config_type = "json"
+	client.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	client.server_key_path = registered.server_key_path
+	client.set("server_key_path_aliases", registered.get("server_key_path_aliases"))
+	client.entry_url_field = registered.entry_url_field
+	client.entry_extra_fields = registered.entry_extra_fields.duplicate(true)
+	client.entry_initial_fields = registered.entry_initial_fields.duplicate(true)
+	client.command_shape = registered.command_shape
+	client.command_transport_key = registered.command_transport_key
+	client.command_transport_value = registered.command_transport_value
+	client.command_initial_fields = registered.command_initial_fields.duplicate(true)
+	client.command_legacy_keys = registered.command_legacy_keys
+	client.command_user_fields = registered.command_user_fields
+	client.command_timeout_fields = registered.command_timeout_fields
+	client.command_env_legacy_keys = registered.command_env_legacy_keys
+	client.command_supports_url_fallback = registered.command_supports_url_fallback
+	return client
+
+
 func _claude_cli_clone(path: String) -> McpClient:
 	var registered := McpClientRegistry.get_by_id("claude_code")
 	var client := McpClient.new()

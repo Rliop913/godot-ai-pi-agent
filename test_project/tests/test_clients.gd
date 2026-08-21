@@ -253,6 +253,11 @@ func test_pi_client_json_descriptor() -> void:
 	assert_true(client.detect_paths.has("$USERPROFILE/.pi/agent/mcp.json"))
 	assert_eq(client.server_key_path.size(), 1)
 	assert_eq(String(client.server_key_path[0]), "mcpServers")
+	var server_key_path_aliases: Array = client.get("server_key_path_aliases")
+	assert_eq(server_key_path_aliases.size(), 2)
+	if server_key_path_aliases.size() == 2:
+		assert_eq(server_key_path_aliases[0], PackedStringArray(["mcp-servers"]))
+		assert_eq(server_key_path_aliases[1], PackedStringArray(["servers"]))
 	assert_eq(client.entry_url_field, "url")
 	assert_eq(client.command_shape, McpClient.CommandShape.FLAT)
 	var expected_legacy := PackedStringArray(["url", "headers", "type"])

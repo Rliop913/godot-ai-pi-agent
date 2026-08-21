@@ -89,6 +89,10 @@ var _config_path_warning_mutex := Mutex.new()
 ## VS Code:                                ["servers"]
 ## OpenCode:                               ["mcp"]
 var server_key_path: PackedStringArray = PackedStringArray()
+## Alternative server-map paths accepted by the client, in precedence order
+## after `server_key_path`. JSON strategy operations select the first non-null
+## existing path so Configure, status, and Remove agree with the client parser.
+var server_key_path_aliases: Array[PackedStringArray] = []
 
 ## Field inside the entry dict that holds our server URL.
 ## "url" by default; some clients use "serverUrl" or "httpUrl".

@@ -30,7 +30,7 @@ static func configure(
 	if not launch_error.is_empty():
 		return {"status": "error", "message": launch_error}
 	var config: Dictionary = read["data"]
-	var holder := _ensure_path(config, client.server_key_path)
+	var holder := _ensure_path(config, _select_server_key_path(config, client))
 	## Pass the existing entry through so `build_entry` can preserve user-mutable
 	## state (auto-approval lists, `disabled` toggles) instead of resetting it
 	## to descriptor defaults on every Configure click. See `entry_initial_fields`
@@ -74,7 +74,7 @@ static func check_status_details(
 	if not read["ok"]:
 		return {"status": McpClient.Status.ERROR, "error_msg": String(read["error"])}
 	var config: Dictionary = read["data"]
-	var holder := _walk_path(config, client.server_key_path)
+	var holder := _walk_path(config, _select_server_key_path(config, client))
 	if not (holder is Dictionary) or not holder.has(server_name):
 		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
 	var entry = holder[server_name]
@@ -103,7 +103,7 @@ static func remove(client: McpClient, server_name: String) -> Dictionary:
 	if not read["ok"]:
 		return {"status": "error", "message": "Refusing to rewrite %s: %s." % [path, read["error"]]}
 	var config: Dictionary = read["data"]
-	var holder := _walk_path(config, client.server_key_path)
+	var holder := _walk_path(config, _select_server_key_path(config, client))
 	if holder is Dictionary and holder.has(server_name):
 		holder.erase(server_name)
 		if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
@@ -314,6 +314,25 @@ static func _walk_path(root: Dictionary, key_path: PackedStringArray) -> Variant
 			return null
 		cur = cur[key]
 	return cur
+
+
+## Match clients that accept multiple server-map keys without creating a
+## higher-precedence canonical map that shadows an existing legacy map. A
+## non-null scalar still wins, matching nullish-coalescing parsers; Configure's
+## `_ensure_path` then repairs it using the strategy's existing behavior.
+static func _select_server_key_path(root: Dictionary, client: McpClient) -> PackedStringArray:
+	var candidates: Array[PackedStringArray] = [client.server_key_path]
+	# Dynamic access keeps mixed-snapshot self-updates parse-safe when a new
+	# strategy is briefly loaded with an older McpClient base (#398/#736).
+	var aliases = client.get("server_key_path_aliases")
+	if aliases is Array:
+		for alias in aliases:
+			if alias is PackedStringArray:
+				candidates.append(alias)
+	for key_path in candidates:
+		if _walk_path(root, key_path) != null:
+			return key_path
+	return client.server_key_path
 
 
 ## Godot's JSON.parse turns every JSON number into a float, so a later
