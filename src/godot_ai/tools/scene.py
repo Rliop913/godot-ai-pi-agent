@@ -33,6 +33,7 @@ Ops:
 
 
 def register_scene_tools(mcp: FastMCP, *, include_non_core: bool = True) -> None:
+    """Register scene-domain MCP tools and resources."""
     @mcp.tool()
     async def scene_get_hierarchy(
         ctx: Context,

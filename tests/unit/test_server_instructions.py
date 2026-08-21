@@ -107,16 +107,19 @@ _FROZEN_NO_EXCLUSION_TEXT = (
 
 
 def _registered_tools(exclude: set[str] | None = None) -> set[str]:
+    """Return tool names registered for the requested domain exclusions."""
     server = create_server(exclude_domains=exclude)
     return {t.name for t in asyncio.run(server.list_tools())}
 
 
 def _registered_tool(name: str):
+    """Return one registered tool definition by name."""
     server = create_server()
     return next(tool for tool in asyncio.run(server.list_tools()) if tool.name == name)
 
 
 def test_editor_state_description_teaches_code_mode_call_signature():
+    """The editor-state description should teach the Pi call signature."""
     description = _registered_tool("editor_state").description
 
     assert "call('godot-ai', 'editor_state', {})" in description
@@ -125,6 +128,7 @@ def test_editor_state_description_teaches_code_mode_call_signature():
 
 
 def test_scene_and_node_descriptions_explain_persistence_and_subresources():
+    """Scene and node descriptions should explain persistence semantics."""
     scene_description = _registered_tool("scene_manage").description
     node_description = _registered_tool("node_set_property").description
 

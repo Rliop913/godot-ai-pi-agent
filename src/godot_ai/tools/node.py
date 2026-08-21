@@ -50,6 +50,7 @@ doesn't match.
 
 
 def register_node_tools(mcp: FastMCP, *, include_non_core: bool = True) -> None:
+    """Register node-domain MCP tools and resources."""
     @mcp.tool()
     async def node_get_properties(
         ctx: Context,

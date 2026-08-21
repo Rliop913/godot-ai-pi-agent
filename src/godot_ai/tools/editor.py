@@ -52,6 +52,7 @@ Ops:
 
 
 def register_editor_tools(mcp: FastMCP, *, include_non_core: bool = True) -> None:
+    """Register editor-domain MCP tools and resources."""
     @mcp.tool()
     async def editor_state(ctx: Context, session_id: str = "") -> dict:
         """Get current Godot editor state: version, readiness, open scene, play state.
