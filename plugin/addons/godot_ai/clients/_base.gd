@@ -78,6 +78,16 @@ var path_template: Dictionary = {}
 ## `path_template` remains the fallback.
 var config_path_candidates: Dictionary = {}
 
+## Optional global JSON config files merged by the client from lowest to highest
+## precedence. Unlike `config_path_candidates`, every existing file participates;
+## Configure updates the effective last definition, status verifies it, and
+## Remove clears every global definition transactionally.
+var config_merge_path_templates: Dictionary = {}
+## Project-relative tiers that may override the global files. Their root is the
+## external client's working directory, which the Godot process cannot know.
+## The strategy checks plausible roots and fails closed instead of mutating them.
+var config_merge_project_paths: PackedStringArray = PackedStringArray()
+
 ## De-duplicate persistent path-ambiguity warnings across recurring status
 ## refreshes. The actionable message still returns on every resolution; only
 ## the editor-console echo is single-shot until the ambiguity clears/changes.

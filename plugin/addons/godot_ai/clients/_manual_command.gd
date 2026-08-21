@@ -125,25 +125,30 @@ static func _build_json(
 	resolved_path: String,
 	launch: Dictionary = {},
 ) -> String:
-	var key := client.server_key_path[0] if client.server_key_path.size() > 0 else "mcpServers"
+	var target := McpJsonStrategy.manual_target_details(client, server_name, resolved_path)
+	if not target.get("ok", false):
+		return "Cannot build manual configuration instructions: %s" % str(target.get("error", "cannot inspect config"))
+	var target_path := str(target.get("path", resolved_path))
+	var key_path: PackedStringArray = target.get("key_path", client.server_key_path)
+	var key := key_path[0] if key_path.size() > 0 else "mcpServers"
 	if client.command_shape != McpClient.CommandShape.NONE:
 		var lines: Array[String] = []
 		var launch_error := McpJsonStrategy.command_launch_error(client, launch)
 		if launch_error.is_empty():
 			var command_entry := McpJsonStrategy.build_entry(client, server_url, null, launch)
-			lines.append("Edit %s and add under \"%s\":" % [resolved_path, key])
+			lines.append("Edit %s and add under \"%s\":" % [target_path, key])
 			lines.append("  \"%s\": %s" % [server_name, _format_entry_inline(command_entry)])
 		else:
 			lines.append("Attach launch command unavailable: %s" % launch_error)
 		if client.command_supports_url_fallback:
 			lines.append("")
 			lines.append("Advanced fallback — use this URL-mode entry instead; never configure both shapes together. URL mode depends on your client's own reconnect behavior. If the server is down when the client starts, restarting the client may be required.")
-			lines.append("Edit %s and add under \"%s\":" % [resolved_path, key])
+			lines.append("Edit %s and add under \"%s\":" % [target_path, key])
 			var fallback_entry := McpJsonStrategy.build_url_entry(client, server_url)
 			lines.append("  \"%s\": %s" % [server_name, _format_entry_inline(fallback_entry)])
 		return "\n".join(lines)
 	var entry := McpJsonStrategy.build_entry(client, server_url)
-	return "Edit %s and add under \"%s\":\n  \"%s\": %s" % [resolved_path, key, server_name, _format_entry_inline(entry)]
+	return "Edit %s and add under \"%s\":\n  \"%s\": %s" % [target_path, key, server_name, _format_entry_inline(entry)]
 
 
 static func _build_toml(

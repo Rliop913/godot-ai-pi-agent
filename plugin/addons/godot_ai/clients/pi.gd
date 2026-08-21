@@ -16,6 +16,20 @@ func _init() -> void:
 		"unix": "~/.pi/agent/mcp.json",
 		"windows": "$USERPROFILE/.pi/agent/mcp.json",
 	}
+	# Pi merges these files in order; later definitions of the same server win.
+	# Keep this separate from config_path_candidates, whose entries are alternatives
+	# rather than merge tiers.
+	config_merge_path_templates = {
+		"unix": PackedStringArray([
+			"~/.pi/agent/mcp.json",
+			"~/.pi/agent/.mcp.json",
+		]),
+		"windows": PackedStringArray([
+			"$USERPROFILE/.pi/agent/mcp.json",
+			"$USERPROFILE/.pi/agent/.mcp.json",
+		]),
+	}
+	config_merge_project_paths = PackedStringArray([".pi/mcp.json", ".mcp.json"])
 	server_key_path = PackedStringArray(["mcpServers"])
 	# pi-codemode-mcp resolves these with nullish precedence:
 	# mcpServers ?? mcp-servers ?? servers. Reuse whichever map already exists

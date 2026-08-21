@@ -258,6 +258,21 @@ func test_pi_client_json_descriptor() -> void:
 	if server_key_path_aliases.size() == 2:
 		assert_eq(server_key_path_aliases[0], PackedStringArray(["mcp-servers"]))
 		assert_eq(server_key_path_aliases[1], PackedStringArray(["servers"]))
+	var merge_templates: Dictionary = client.get("config_merge_path_templates")
+	assert_false(merge_templates.is_empty(), "Pi must declare its ordered global merge tiers")
+	var merge_key := McpPathTemplate.platform_key(merge_templates)
+	assert_false(merge_key.is_empty(), "Pi merge tiers must support this platform")
+	if not merge_key.is_empty():
+		var merge_paths: PackedStringArray = merge_templates[merge_key]
+		assert_eq(merge_paths.size(), 2)
+		if merge_paths.size() == 2:
+			assert_true(String(merge_paths[0]).ends_with("/mcp.json"))
+			assert_true(String(merge_paths[1]).ends_with("/.mcp.json"))
+	assert_eq(
+		client.get("config_merge_project_paths"),
+		PackedStringArray([".pi/mcp.json", ".mcp.json"]),
+		"Pi project tiers must match upstream load order",
+	)
 	assert_eq(client.entry_url_field, "url")
 	assert_eq(client.command_shape, McpClient.CommandShape.FLAT)
 	var expected_legacy := PackedStringArray(["url", "headers", "type"])

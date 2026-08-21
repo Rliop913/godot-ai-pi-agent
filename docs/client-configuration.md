@@ -59,8 +59,14 @@ Per-strategy command rendering (`CommandShape` docs in `_base.gd`):
   from a previous http-era entry join `command_legacy_keys` and are
   scrubbed on reconfigure.
   Pi also accepts top-level `mcpServers`, `mcp-servers`, and `servers` maps;
-  Configure reuses the first existing map in that precedence order so it does
-  not shadow and deactivate legacy entries.
+  Configure and manual instructions reuse the first existing map in that
+  precedence order so they do not shadow and deactivate legacy entries. Pi
+  merges `~/.pi/agent/mcp.json`, `~/.pi/agent/.mcp.json`, then project-level
+  `.pi/mcp.json` and `.mcp.json`. Configure updates the effective highest global
+  definition, status verifies it, and Remove clears all global definitions with
+  rollback on partial failure. Because project tiers are relative to Pi's own
+  working directory, the dock identifies plausible overrides but fails closed
+  with the exact path instead of mutating an inferred project root.
 
 ### Pi Agent code-mode call syntax
 
