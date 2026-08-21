@@ -233,9 +233,9 @@ func test_pi_client_json_descriptor() -> void:
 	## descriptors that called one failed silently with "unknown subcommand",
 	## and a CLI-shape descriptor would have the same fate. Pin the JSON shape
 	## so a future revert reintroduces the failure loudly here instead of at
-	## Configure time. Transport is inferred from key presence (command vs
-	## url), so `command_transport_key` MUST stay unset — pinning a type
-	## discriminator would hand pi-codemode-mcp an entry it routes wrongly.
+	## Configure time. Pi selects transport from `command` vs `url` and ignores
+	## `type`; keep command_transport_key unset so generated stdio entries remain
+	## canonical and typeless.
 	var client := McpClientRegistry.get_by_id("pi")
 	assert_true(client != null, "pi must remain registered")
 	assert_eq(client.config_type, "json")
@@ -272,11 +272,11 @@ func test_pi_client_json_descriptor() -> void:
 	)
 	assert_true(
 		client.command_transport_key.is_empty(),
-		"Pi must not declare a transport discriminator"
+		"Pi stdio entries must remain typeless"
 	)
 	assert_true(
 		client.command_transport_value == null or str(client.command_transport_value) == "",
-		"Pi is typeless — any command_transport_value pins a discriminator the loader will route wrongly"
+		"Pi stdio entries must not emit a transport discriminator value"
 	)
 	assert_eq(
 		client.entry_initial_fields.size(),

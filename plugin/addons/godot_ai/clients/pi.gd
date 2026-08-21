@@ -26,18 +26,13 @@ func _init() -> void:
 	]
 	set("server_key_path_aliases", aliases)
 	entry_url_field = "url"
-	# No transport pin: pi-codemode-mcp infers stdio vs http from key
-	# presence (command vs url). Pinning a `type` discriminator would
-	# mismatch the loader and is the exact mistake OpenCode makes on its
-	# own `type: "local"` field; antigravity is the closer analog.
+	# pi-codemode-mcp selects stdio from `command` and remote transport from
+	# `url`; it ignores `type`. Keep generated stdio entries minimal and typeless.
 	entry_extra_fields = {}
 	entry_initial_fields = {}
-	# Attach migration (#838). Pi stdio entries are flat command/args/env
-	# with no type discriminator (mirrors antigravity's typeless shape).
-	# Legacy URL entries carry `url` and optionally `headers`; a `type`
-	# key from a previous http-era migration must not survive next to a
-	# command — Configure would otherwise hand pi an entry that infers
-	# the wrong transport.
+	# Attach migration (#838). Pi stdio entries are flat command/args/env.
+	# When Configure replaces a legacy URL entry, remove `url`, `headers`, and
+	# any redundant `type` field so the generated stdio entry stays canonical.
 	command_shape = McpClient.CommandShape.FLAT
 	command_legacy_keys = PackedStringArray(["url", "headers", "type"])
 	# `env` is the only user-mutable field pi's docs surface. Future
