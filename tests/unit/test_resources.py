@@ -66,9 +66,12 @@ class TestResourceRegistration:
 
     async def test_total_resource_count(self, mcp):
         ## 7 originals + 5 list resources (editor/state, materials, input_map,
-        ## performance, test/results). Node + script templates are exposed as
-        ## resource templates rather than concrete resource URIs.
-        assert len(await self._resource_uris(mcp)) == 12
+        ## performance, test/results) + custom-tools. Node + script templates
+        ## are exposed as resource templates rather than concrete resource URIs.
+        assert len(await self._resource_uris(mcp)) == 13
+
+    async def test_custom_tools_resource_registered(self, mcp):
+        assert "godot://custom-tools" in await self._resource_uris(mcp)
 
 
 class TestCommonSettingsList:

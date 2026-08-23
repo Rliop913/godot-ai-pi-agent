@@ -129,3 +129,11 @@ class ReadinessChangedEvent(BaseModel):
 class PluginTelemetryEvent(BaseModel):
     name: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class CustomToolsChangedEvent(BaseModel):
+    ## Required (no default): a snapshot event without a tools list is
+    ## malformed, not "empty". Bounded per the server-side catalog budgets
+    ## in services/custom_tool_service.py — the 4 MB WS message cap alone
+    ## must not size the per-session catalog.
+    tools: list[dict[str, Any]] = Field(max_length=128)

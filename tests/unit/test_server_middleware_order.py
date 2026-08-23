@@ -29,6 +29,7 @@ from godot_ai.middleware import (
     ParseStringifiedParams,
     PreserveGodotCommandErrorData,
     StripClientWrapperKwargs,
+    TrackMcpSessions,
 )
 from godot_ai.server import create_server
 
@@ -38,6 +39,13 @@ EXPECTED_ORDER: tuple[type, ...] = (
     ParseStringifiedParams,
     FoldFlatManageParams,
     HintOpTypoOnManage,
+    ## Innermost by convention only — TrackMcpSessions is purely
+    ## observational (records the request's ServerSession for the
+    ## tools/list_changed broadcast) and never reshapes request or
+    ## response, so its position is NOT load-bearing. It lives in the
+    ## lock so the coverage test below keeps forcing every new
+    ## middleware to declare itself here.
+    TrackMcpSessions,
 )
 
 

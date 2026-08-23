@@ -19,12 +19,14 @@ from godot_ai.handlers._readiness import sync_readiness_for_session
 from godot_ai.protocol.envelope import (
     CommandRequest,
     CommandResponse,
+    CustomToolsChangedEvent,
     HandshakeMessage,
     PlayStateChangedEvent,
     PluginTelemetryEvent,
     ReadinessChangedEvent,
     SceneChangedEvent,
 )
+from godot_ai.services.custom_tool_service import CustomToolDefinition, CustomToolService
 from godot_ai.sessions.registry import Session, SessionRegistry
 from godot_ai.telemetry import RecordType, record_telemetry
 from godot_ai.transport.origin_guard import make_websocket_request_guard
@@ -124,6 +126,14 @@ class GodotWebSocketServer:
         ## in depth on top of loopback-only binding (see AGENTS.md's WS
         ## trust-boundary note), not an authentication boundary.
         self._auth_token = auth_token or None
+        ## Coalesced tools/list_changed broadcast. Broadcasts run OFF the
+        ## per-editor receive loop (a stalled MCP transport must not delay
+        ## queued command responses behind its notify_timeout_s cap), and at
+        ## most ONE task is ever in flight: list_changed is a contentless
+        ## poke, so N catalog changes during a stalled send need only one
+        ## trailing re-notification, not N queued tasks.
+        self._broadcast_task: asyncio.Task | None = None
+        self._broadcast_rerun: bool = False
         ## request_id -> (owner session_id, future). The session id is part
         ## of the entry (#690) so (a) a disconnect can immediately fail that
         ## session's in-flight futures instead of leaving callers to wait
@@ -133,6 +143,7 @@ class GodotWebSocketServer:
         ## request_id (defense in depth on top of the uuid4 request ids).
         self._pending: dict[str, tuple[str, asyncio.Future[CommandResponse]]] = {}
         self._connections: dict[str, ServerConnection] = {}
+        self._custom_tool_service: CustomToolService = CustomToolService.get_instance()
 
     async def start(self):
         logger.info("Starting WebSocket server on port %d", self.port)
@@ -222,6 +233,9 @@ class GodotWebSocketServer:
                 readiness=handshake.readiness,
                 editor_pid=handshake.editor_pid,
                 server_launch_mode=handshake.server_launch_mode,
+                ## Mismatches were rejected above, so a present token here is
+                ## the matching one.
+                token_authenticated=bool(self._auth_token is not None and handshake.auth_token),
             )
             self.registry.register(session)
             self._connections[session_id] = ws
@@ -285,7 +299,7 @@ class GodotWebSocketServer:
 
                 # Handle state events from the plugin
                 if data.get("type") == "event":
-                    self._handle_event(session_id, data)
+                    await self._handle_event(session_id, data)
                     continue
 
                 # Handle command responses
@@ -371,6 +385,11 @@ class GodotWebSocketServer:
             if session_id:
                 self.registry.unregister(session_id, close_code=close_code)
                 self._connections.pop(session_id, None)
+                ## Drop this editor's custom tools from the catalog and tell
+                ## MCP clients — a closed editor's tools must not linger as
+                ## invokable entries. Only broadcast if it actually had any.
+                if self._custom_tool_service.remove_session(session_id):
+                    self._schedule_tools_broadcast()
                 ## Fail this session's in-flight futures NOW (#690): a close
                 ## settles nothing by itself, so every in-flight command used
                 ## to wait out its full per-command timeout (120s for
@@ -389,7 +408,37 @@ class GodotWebSocketServer:
                             )
                         )
 
-    def _handle_event(self, session_id: str, data: dict) -> None:
+    def _schedule_tools_broadcast(self) -> None:
+        """Fire a coalesced tools/list_changed broadcast, non-blocking.
+
+        Called from the per-editor receive loop and disconnect cleanup —
+        awaiting the broadcast inline would let one stalled MCP transport
+        (bounded, but up to ``notify_timeout_s`` per session) delay queued
+        command responses behind it. At most one broadcast task is in
+        flight: a change arriving mid-broadcast sets a rerun flag consumed
+        when the current send finishes, so an event burst against a stalled
+        client costs one trailing notification instead of one queued task
+        per event. Single-threaded event loop — the flag needs no lock.
+        """
+        if self._broadcast_task is not None and not self._broadcast_task.done():
+            self._broadcast_rerun = True
+            return
+        self._broadcast_rerun = False
+        self._broadcast_task = asyncio.create_task(self._run_tools_broadcast())
+
+    async def _run_tools_broadcast(self) -> None:
+        while True:
+            try:
+                await self._custom_tool_service.notify_tools_change()
+            except Exception:
+                ## notify_tools_change isolates per-session failures itself;
+                ## this catches anything that still escapes (test doubles).
+                logger.debug("tools/list_changed broadcast failed", exc_info=True)
+            if not self._broadcast_rerun:
+                return
+            self._broadcast_rerun = False
+
+    async def _handle_event(self, session_id: str, data: dict) -> None:
         event = data.get("event", "")
         event_data = data.get("data", {})
         session = self.registry.get(session_id)
@@ -412,6 +461,37 @@ class GodotWebSocketServer:
                 payload = PlayStateChangedEvent.model_validate(event_data)
                 session.play_state = payload.play_state
                 logger.info("Session %s: play state -> %s", session_id[:8], session.play_state)
+            elif event == "custom_tools_changed":
+                ## Catalog text (names/descriptions) is served into the AI
+                ## agent's context, so on a token-configured launch (#690)
+                ## only a session that proved the token may mutate it — an
+                ## unauthenticated local peer must not be able to plant
+                ## agent-visible instructions. Tokenless launches keep the
+                ## compat identity model (any local session accepted); the
+                ## budget caps on CustomToolsChangedEvent/CustomToolDefinition
+                ## bound what such a peer can park either way.
+                if self._auth_token is not None and not session.token_authenticated:
+                    logger.warning(
+                        "Dropping custom_tools_changed from unauthenticated session %s",
+                        session_id[:8],
+                    )
+                    return
+                ## Plugin payload shape: {"tools": [ {...}, ... ]} — see
+                ## plugin.gd::_on_custom_tools_changed. Iterating event_data
+                ## itself would walk dict KEYS, not tool dicts.
+                try:
+                    payload = CustomToolsChangedEvent.model_validate(event_data)
+                    tools = [CustomToolDefinition.model_validate(t) for t in payload.tools]
+                    self._custom_tool_service.update_session_tools(session_id, tools)
+                    logger.info(
+                        "Session %s: custom tools -> %d registered (%d enabled)",
+                        session_id[:8],
+                        len(tools),
+                        sum(tool.enabled for tool in tools),
+                    )
+                    self._schedule_tools_broadcast()
+                except ValidationError as e:
+                    logger.error("Invalid custom tool definition: %s", e)
             elif event == "readiness_changed":
                 payload = ReadinessChangedEvent.model_validate(event_data)
                 session.readiness = payload.readiness

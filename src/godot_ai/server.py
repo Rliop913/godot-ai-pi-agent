@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.tools import Tool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -32,6 +33,7 @@ from godot_ai.middleware import (
     ParseStringifiedParams,
     PreserveGodotCommandErrorData,
     StripClientWrapperKwargs,
+    TrackMcpSessions,
 )
 from godot_ai.orphan_reaper import (
     boot_grace_from_env,
@@ -50,6 +52,7 @@ from godot_ai.protocol.attach import (
     tool_catalog_hash,
 )
 from godot_ai.resources.classes import register_class_resources
+from godot_ai.resources.custom import register_custom_tools_resources
 from godot_ai.resources.editor import register_editor_resources
 from godot_ai.resources.library import register_library_resources
 from godot_ai.resources.nodes import register_node_resources
@@ -57,6 +60,8 @@ from godot_ai.resources.project import register_project_resources
 from godot_ai.resources.scenes import register_scene_resources
 from godot_ai.resources.scripts import register_script_resources
 from godot_ai.resources.sessions import register_session_resources
+from godot_ai.services.custom_tool_service import CustomToolService
+from godot_ai.services.promoted_tools import PromotedToolRegistrar
 from godot_ai.sessions.registry import SessionRegistry
 from godot_ai.telemetry import (
     MilestoneType,
@@ -74,6 +79,7 @@ from godot_ai.tools.batch import register_batch_tools
 from godot_ai.tools.camera import register_camera_tools
 from godot_ai.tools.client import register_client_tools
 from godot_ai.tools.csg import register_csg_tools
+from godot_ai.tools.custom import register_custom_tools
 from godot_ai.tools.domains import CORE_BEARING_DOMAINS, CORE_TOOLS
 from godot_ai.tools.editor import register_editor_tools
 from godot_ai.tools.filesystem import register_filesystem_tools
@@ -118,6 +124,15 @@ class AppContext:
 
 class GodotAIFastMCP(FastMCP):
     """FastMCP server with Godot AI's ASGI diagnostics for HTTP transports."""
+
+    def set_hidden_promoted_tools(self, names: set[str]) -> None:
+        """Keep stale promoted names callable while omitting them from discovery."""
+        self._hidden_promoted_tools = set(names)
+
+    async def list_tools(self, *, run_middleware: bool = True) -> Sequence[Tool]:
+        tools = await super().list_tools(run_middleware=run_middleware)
+        hidden = getattr(self, "_hidden_promoted_tools", set())
+        return [tool for tool in tools if tool.name not in hidden]
 
     def http_app(self, *args: Any, **kwargs: Any):
         app = super().http_app(*args, **kwargs)
@@ -272,6 +287,7 @@ _ROLLUP_BLOCKS: tuple[tuple[str | None, str], ...] = (
         "                   gridmap_get_used_cells, gridmap_list_library_items\n",
     ),
     ("csg", "  csg_manage       csg_create, csg_set_operation\n"),
+    ("custom", "  custom_manage    list, invoke\n"),
 )
 
 ## Resources are registered unconditionally (they never count against tool
@@ -285,7 +301,7 @@ _INSTRUCTIONS_FOOTER = (
     "  godot://class/{class_name},\n"
     "  godot://script/{path}, godot://project/info, godot://project/settings,\n"
     "  godot://materials, godot://input_map, godot://performance,\n"
-    "  godot://test/results\n\n"
+    "  godot://test/results, godot://custom-tools\n\n"
     "Always connect to an editor session first (session_activate or "
     'session_manage(op="list")). Write operations require session readiness; '
     "check editor_state if a call is rejected as 'not writable'. After driving a "
@@ -382,6 +398,20 @@ def create_server(
     async def _lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         leases.clear()
         registry = SessionRegistry()
+        ## Construct BEFORE GodotWebSocketServer — its __init__ resolves the
+        ## singleton via get_instance(), which raises if nothing built it.
+        ## Custom-tool catalog + tools/list_changed broadcast (fed by the
+        ## TrackMcpSessions middleware registered below).
+        custom_tool_service = CustomToolService()
+        if "custom" not in exclude:
+            ## First-class registration for promoted specs — hooks the
+            ## catalog so every WS push/disconnect re-syncs the FastMCP
+            ## tool list before the list_changed broadcast fires.
+            PromotedToolRegistrar(
+                mcp,
+                custom_tool_service,
+                set_hidden_tools=mcp.set_hidden_promoted_tools,
+            )
         ## The WS server is intentionally loopback-only even under --allow-host
         ## (#421): it's the local editor↔server bridge, not a remote surface.
         ## See GodotWebSocketServer.start for the rationale (LAN exposure +
@@ -564,11 +594,18 @@ def create_server(
     ##    it with a ``difflib``-derived "Did you mean…" hint. Must be
     ##    innermost on response so it sees Pydantic's raw ``ValidationError``
     ##    before any outer middleware reshapes or wraps it. See #211.
+    ## 6. `TrackMcpSessions` — part of the load-bearing order above: purely observational —
+    ##    records each request's ServerSession into CustomToolService's WeakSet
+    ##    so custom_tools_changed WS events (which arrive OUTSIDE any MCP
+    ##    request context) can broadcast notifications/tools/list_changed via
+    ##    ServerSession.send_tool_list_changed(). Never reshapes request or
+    ##    response, so its position in the chain is irrelevant.
     mcp.add_middleware(PreserveGodotCommandErrorData())
     mcp.add_middleware(StripClientWrapperKwargs())
     mcp.add_middleware(ParseStringifiedParams())
     mcp.add_middleware(FoldFlatManageParams())
     mcp.add_middleware(HintOpTypoOnManage())
+    mcp.add_middleware(TrackMcpSessions())
 
     ## Wrap ``mcp.tool`` / ``mcp.resource`` once, before any
     ## ``register_*`` call below, so every tool and resource registered
@@ -778,6 +815,8 @@ def create_server(
         register_gridmap_tools(mcp)
     if "csg" not in exclude:
         register_csg_tools(mcp)
+    if "custom" not in exclude:
+        register_custom_tools(mcp)
 
     register_session_resources(mcp)
     register_scene_resources(mcp)
@@ -787,5 +826,6 @@ def create_server(
     register_script_resources(mcp)
     register_library_resources(mcp)
     register_class_resources(mcp)
+    register_custom_tools_resources(mcp)
 
     return mcp

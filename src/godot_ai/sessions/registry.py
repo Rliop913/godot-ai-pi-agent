@@ -62,6 +62,12 @@ class Session:
     ## dev `.venv` is silently overriding the published install. Older
     ## plugins omit this in the handshake; default is "unknown".
     server_launch_mode: str = "unknown"
+    ## True when the handshake carried the auth token matching this launch's
+    ## GODOT_AI_WS_TOKEN (#690). Tokenless handshakes are still accepted for
+    ## compat, but stay False here so token-configured launches can restrict
+    ## agent-facing surfaces (e.g. the custom-tool catalog) to sessions that
+    ## actually proved the secret.
+    token_authenticated: bool = False
     connected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

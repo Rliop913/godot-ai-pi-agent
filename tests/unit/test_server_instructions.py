@@ -84,7 +84,8 @@ _FROZEN_NO_EXCLUSION_TEXT = (
     "  tileset_manage   tileset_get_atlas_tiles, tileset_get_atlas_image\n"
     "  gridmap_manage   gridmap_set_item, gridmap_fill, gridmap_clear,\n"
     "                   gridmap_get_used_cells, gridmap_list_library_items\n"
-    "  csg_manage       csg_create, csg_set_operation\n\n"
+    "  csg_manage       csg_create, csg_set_operation\n"
+    "  custom_manage    list, invoke\n\n"
     "Resources (read-only URIs, no tool-count cost — prefer for active-session "
     "reads when the client surfaces them):\n"
     "  godot://sessions, godot://editor/state, godot://selection/current,\n"
@@ -93,7 +94,7 @@ _FROZEN_NO_EXCLUSION_TEXT = (
     "  godot://class/{class_name},\n"
     "  godot://script/{path}, godot://project/info, godot://project/settings,\n"
     "  godot://materials, godot://input_map, godot://performance,\n"
-    "  godot://test/results\n\n"
+    "  godot://test/results, godot://custom-tools\n\n"
     "Always connect to an editor session first (session_activate or "
     'session_manage(op="list")). Write operations require session readiness; '
     "check editor_state if a call is rejected as 'not writable'. After driving a "

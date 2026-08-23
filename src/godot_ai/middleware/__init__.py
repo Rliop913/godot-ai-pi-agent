@@ -11,6 +11,7 @@ from godot_ai.middleware.fold_flat_manage_params import FoldFlatManageParams
 from godot_ai.middleware.godot_command_error import PreserveGodotCommandErrorData
 from godot_ai.middleware.op_typo_hint import HintOpTypoOnManage
 from godot_ai.middleware.parse_stringified_params import ParseStringifiedParams
+from godot_ai.middleware.track_mcp_sessions import TrackMcpSessions
 
 __all__ = [
     "CLIENT_WRAPPER_KWARGS",
@@ -19,5 +20,6 @@ __all__ = [
     "ParseStringifiedParams",
     "PreserveGodotCommandErrorData",
     "StripClientWrapperKwargs",
+    "TrackMcpSessions",
     "find_pydantic_validation_error",
 ]

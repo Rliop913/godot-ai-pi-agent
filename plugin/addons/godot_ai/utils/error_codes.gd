@@ -96,6 +96,8 @@ const PROPERTY_NOT_ON_CLASS := "PROPERTY_NOT_ON_CLASS"
 const VALUE_OUT_OF_RANGE := "VALUE_OUT_OF_RANGE"
 const WRONG_TYPE := "WRONG_TYPE"
 const MISSING_REQUIRED_PARAM := "MISSING_REQUIRED_PARAM"
+const CUSTOM_TOOL_NOT_UNDOABLE := "CUSTOM_TOOL_NOT_UNDOABLE"
+const CUSTOM_TOOL_DISABLED := "CUSTOM_TOOL_DISABLED"
 
 ## #651 stage 1: EDITOR_NOT_READY sub-codes. These travel in
 ## `error.data.sub_code`, NEVER as the top-level `error.code` — existing
