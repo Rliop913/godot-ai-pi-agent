@@ -12,9 +12,10 @@ static func configure(
 	server_name: String,
 	server_url: String,
 	launch: Dictionary = {},
+	project_roots: PackedStringArray = PackedStringArray(),
 ) -> Dictionary:
 	if _uses_merge_tiers(client):
-		return _configure_merged(client, server_name, server_url, launch)
+		return _configure_merged(client, server_name, server_url, launch, project_roots)
 	var resolution := client.resolved_config_path_details()
 	var path := str(resolution.get("path", ""))
 	var path_error := str(resolution.get("error", ""))
@@ -52,16 +53,17 @@ static func _configure_merged(
 	server_name: String,
 	server_url: String,
 	launch: Dictionary,
+	project_roots: PackedStringArray,
 ) -> Dictionary:
 	var launch_error := command_launch_error(client, launch)
 	if not launch_error.is_empty():
 		return {"status": "error", "message": launch_error}
-	var project := _load_project_definitions(client, server_name)
+	var project := _load_project_definitions(client, server_name, project_roots)
 	if not project.get("ok", false):
 		return {"status": "error", "message": str(project.get("error", "Cannot inspect project config tiers"))}
 	var project_tiers: Array = project.get("tiers", [])
 	if not project_tiers.is_empty():
-		return {"status": "error", "message": _project_override_message(project_tiers, "update or remove")}
+		return {"status": "error", "message": _project_override_message(project_tiers, "update or remove", client.display_name, server_name)}
 	var loaded := _load_merge_tiers(client)
 	if not loaded.get("ok", false):
 		return {"status": "error", "message": str(loaded.get("error", "Cannot read merged config tiers"))}
@@ -90,8 +92,9 @@ static func check_status(
 	server_name: String,
 	server_url: String,
 	launch: Dictionary = {},
+	project_roots: PackedStringArray = PackedStringArray(),
 ) -> McpClient.Status:
-	return check_status_details(client, server_name, server_url, launch).get("status", McpClient.Status.NOT_CONFIGURED)
+	return check_status_details(client, server_name, server_url, launch, project_roots).get("status", McpClient.Status.NOT_CONFIGURED)
 
 
 ## Detailed variant feeding the dock's error_msg plumbing (#711): a config
@@ -104,9 +107,10 @@ static func check_status_details(
 	server_name: String,
 	server_url: String,
 	launch: Dictionary = {},
+	project_roots: PackedStringArray = PackedStringArray(),
 ) -> Dictionary:
 	if _uses_merge_tiers(client):
-		return _check_status_merged(client, server_name, server_url, launch)
+		return _check_status_merged(client, server_name, server_url, launch, project_roots)
 	var resolution := client.resolved_config_path_details()
 	var path := str(resolution.get("path", ""))
 	var path_error := str(resolution.get("error", ""))
@@ -130,6 +134,7 @@ static func _check_status_merged(
 	server_name: String,
 	server_url: String,
 	launch: Dictionary,
+	project_roots: PackedStringArray,
 ) -> Dictionary:
 	var loaded := _load_merge_tiers(client)
 	if not loaded.get("ok", false):
@@ -140,7 +145,7 @@ static func _check_status_merged(
 		var holder := _walk_path(config, select_server_key_path(config, client))
 		if holder is Dictionary and holder.has(server_name):
 			effective = holder[server_name]
-	var project := _load_project_definitions(client, server_name)
+	var project := _load_project_definitions(client, server_name, project_roots)
 	if not project.get("ok", false):
 		return {"status": McpClient.Status.ERROR, "error_msg": str(project.get("error", "Cannot inspect project config tiers"))}
 	var project_tiers: Array = project.get("tiers", [])
@@ -148,7 +153,7 @@ static func _check_status_merged(
 		for project_tier in project_tiers:
 			var details := _entry_status_details(client, project_tier["entry"], server_url, launch)
 			if details.get("status") != McpClient.Status.CONFIGURED:
-				return {"status": McpClient.Status.CONFIGURED_MISMATCH, "error_msg": _project_override_message(project_tiers, "update or remove")}
+				return {"status": McpClient.Status.CONFIGURED_MISMATCH, "error_msg": _project_override_message(project_tiers, "update or remove", client.display_name, server_name)}
 		return {"status": McpClient.Status.CONFIGURED, "error_msg": ""}
 	if effective == null:
 		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
@@ -171,9 +176,13 @@ static func _entry_status_details(
 	return {"status": McpClient.Status.CONFIGURED_MISMATCH, "error_msg": ""}
 
 
-static func remove(client: McpClient, server_name: String) -> Dictionary:
+static func remove(
+	client: McpClient,
+	server_name: String,
+	project_roots: PackedStringArray = PackedStringArray(),
+) -> Dictionary:
 	if _uses_merge_tiers(client):
-		return _remove_merged(client, server_name)
+		return _remove_merged(client, server_name, project_roots)
 	var resolution := client.resolved_config_path_details()
 	var path := str(resolution.get("path", ""))
 	var path_error := str(resolution.get("error", ""))
@@ -193,13 +202,15 @@ static func remove(client: McpClient, server_name: String) -> Dictionary:
 	return {"status": "ok", "message": "%s configuration removed" % client.display_name}
 
 
-static func _remove_merged(client: McpClient, server_name: String) -> Dictionary:
-	var project := _load_project_definitions(client, server_name)
+static func _remove_merged(
+	client: McpClient, server_name: String, project_roots: PackedStringArray
+) -> Dictionary:
+	var project := _load_project_definitions(client, server_name, project_roots)
 	if not project.get("ok", false):
 		return {"status": "error", "message": str(project.get("error", "Cannot inspect project config tiers"))}
 	var project_tiers: Array = project.get("tiers", [])
 	if not project_tiers.is_empty():
-		return {"status": "error", "message": _project_override_message(project_tiers, "remove")}
+		return {"status": "error", "message": _project_override_message(project_tiers, "remove", client.display_name, server_name)}
 	var loaded := _load_merge_tiers(client)
 	if not loaded.get("ok", false):
 		return {"status": "error", "message": str(loaded.get("error", "Cannot read merged config tiers"))}
@@ -216,6 +227,8 @@ static func _remove_merged(client: McpClient, server_name: String) -> Dictionary
 				"text": JSON.stringify(_narrow_integral_numbers(config), "\t", false),
 				"original_text": tier["original_text"],
 			})
+	if writes.is_empty():
+		return {"status": "ok", "message": "Not configured"}
 	var written := _write_transaction(writes)
 	if not written.get("ok", false):
 		return {"status": "error", "message": written.get("error", "Cannot remove merged configuration")}
@@ -374,35 +387,53 @@ static func _arrays_equal(left: Variant, right: Variant) -> bool:
 	return true
 
 
+## Read a config file once and parse the captured text. Returns
+## {"exists": bool, "ok": bool, "data": Dictionary, "original_text": String}
+## when the file is absent or parses cleanly, and
+## {"exists": true, "ok": false, "error": String, "original_text": String}
+## when the file exists with non-empty content we cannot safely round-trip.
+## Callers must NOT treat the error path as an empty config — doing so blows
+## away the user's other MCP entries on the next write. The `original_text`
+## is the exact captured source so transactional rollback can restore
+## byte-for-byte; the UTF-8 BOM is stripped only from the parsing copy.
+static func _read_file_text(path: String) -> Dictionary:
+	if not FileAccess.file_exists(path):
+		return {"exists": false, "ok": true, "data": {}, "original_text": ""}
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		var open_err := FileAccess.get_open_error()
+		return {"exists": true, "ok": false, "error": "could not open for reading (error %d)" % open_err, "original_text": ""}
+	var content := file.get_as_text()
+	file.close()
+	if content.strip_edges().is_empty():
+		return {"exists": true, "ok": true, "data": {}, "original_text": content}
+	var parse_copy := content
+	# Strip a UTF-8 BOM if present — some editors (notably on Windows) save
+	# JSON with a leading ﻿, which Godot's JSON.parse rejects outright.
+	# Previously this landed on the "unparseable → wipe" path.
+	if parse_copy.begins_with("﻿"):
+		parse_copy = parse_copy.substr(1)
+	var json := JSON.new()
+	if json.parse(parse_copy) != OK:
+		var msg := "JSON parse error on line %d: %s" % [json.get_error_line(), json.get_error_message()]
+		push_warning("MCP | %s in %s" % [msg, path])
+		return {"exists": true, "ok": false, "error": msg, "original_text": content}
+	if not (json.data is Dictionary):
+		return {"exists": true, "ok": false, "error": "top-level value is %s, expected object" % type_string(typeof(json.data)), "original_text": content}
+	return {"exists": true, "ok": true, "data": json.data, "original_text": content}
+
+
 ## Returns {"ok": true, "data": Dictionary} when the file is absent or parses
 ## cleanly, and {"ok": false, "error": String} when the file exists with
 ## non-empty content we cannot safely round-trip. Callers must NOT fall back
 ## to an empty dict on the error path — doing so blows away the user's other
 ## MCP entries on the next write.
 static func _read_or_init(path: String) -> Dictionary:
-	if not FileAccess.file_exists(path):
-		return {"ok": true, "data": {}}
-	var file := FileAccess.open(path, FileAccess.READ)
-	if file == null:
-		var err := FileAccess.get_open_error()
-		return {"ok": false, "error": "could not open for reading (error %d)" % err}
-	var content := file.get_as_text()
-	file.close()
-	# Strip a UTF-8 BOM if present — some editors (notably on Windows) save
-	# JSON with a leading ﻿, which Godot's JSON.parse rejects outright.
-	# Previously this landed on the "unparseable → wipe" path.
-	if content.begins_with("﻿"):
-		content = content.substr(1)
-	if content.strip_edges().is_empty():
-		return {"ok": true, "data": {}}
-	var json := JSON.new()
-	if json.parse(content) != OK:
-		var msg := "JSON parse error on line %d: %s" % [json.get_error_line(), json.get_error_message()]
-		push_warning("MCP | %s in %s" % [msg, path])
-		return {"ok": false, "error": msg}
-	if not (json.data is Dictionary):
-		return {"ok": false, "error": "top-level value is %s, expected object" % type_string(typeof(json.data))}
-	return {"ok": true, "data": json.data}
+	var read := _read_file_text(path)
+	var result: Dictionary = {"ok": read.get("ok", false), "data": read.get("data", {})}
+	if not result.get("ok", false):
+		result["error"] = read.get("error", "")
+	return result
 
 
 ## Walk a key path, creating intermediate Dicts as needed. Returns the leaf Dict.
@@ -470,7 +501,9 @@ static func _merge_paths(client: McpClient) -> PackedStringArray:
 ## Pi's project tiers are relative to Pi's process cwd, not Godot's. Inspect
 ## plausible roots only to detect overrides; callers fail closed rather than
 ## mutating both guesses.
-static func _project_candidate_paths(client: McpClient) -> PackedStringArray:
+static func _project_candidate_paths(
+	client: McpClient, roots: PackedStringArray
+) -> PackedStringArray:
 	var result := PackedStringArray()
 	var project_paths = client.get("config_merge_project_paths")
 	if not (project_paths is PackedStringArray):
@@ -479,12 +512,6 @@ static func _project_candidate_paths(client: McpClient) -> PackedStringArray:
 		var absolute_path := String(project_path).simplify_path()
 		if absolute_path.is_absolute_path() and FileAccess.file_exists(absolute_path) and not result.has(absolute_path):
 			result.append(absolute_path)
-	var current_access := DirAccess.open(".")
-	var current_root := "" if current_access == null else current_access.get_current_dir().simplify_path()
-	var roots := PackedStringArray([
-		current_root,
-		ProjectSettings.globalize_path("res://").simplify_path(),
-	])
 	for root in roots:
 		if String(root).is_empty():
 			continue
@@ -497,9 +524,11 @@ static func _project_candidate_paths(client: McpClient) -> PackedStringArray:
 	return result
 
 
-static func _load_project_definitions(client: McpClient, server_name: String) -> Dictionary:
+static func _load_project_definitions(
+	client: McpClient, server_name: String, project_roots: PackedStringArray
+) -> Dictionary:
 	var tiers: Array[Dictionary] = []
-	for path in _project_candidate_paths(client):
+	for path in _project_candidate_paths(client, project_roots):
 		var read := _read_or_init(path)
 		if not read.get("ok", false):
 			return {"ok": false, "error": "Cannot inspect project config %s: %s" % [path, read.get("error", "invalid JSON")]}
@@ -516,19 +545,19 @@ static func _load_project_definitions(client: McpClient, server_name: String) ->
 	return {"ok": true, "tiers": tiers}
 
 
-static func _project_override_message(tiers: Array, action: String) -> String:
+static func _project_override_message(
+	tiers: Array, action: String, client_name: String, server_name: String
+) -> String:
 	var paths := PackedStringArray()
 	for tier in tiers:
 		paths.append(str(tier["path"]))
-	return "Pi project config overrides godot-ai at %s. Pi resolves project files from its own working directory, so the dock cannot safely choose one; %s the entry manually." % [", ".join(paths), action]
+	return "%s project config overrides %s at %s. %s resolves project files from its own working directory, so the dock cannot safely choose one; %s the entry manually." % [client_name, server_name, ", ".join(paths), client_name, action]
 
 
 static func _load_merge_tiers(client: McpClient) -> Dictionary:
 	var tiers: Array[Dictionary] = []
 	for path in _merge_paths(client):
-		var exists := FileAccess.file_exists(path)
-		var original_text := FileAccess.get_file_as_string(path) if exists else ""
-		var read := _read_or_init(path)
+		var read := _read_file_text(path)
 		if not read.get("ok", false):
 			return {
 				"ok": false,
@@ -536,9 +565,9 @@ static func _load_merge_tiers(client: McpClient) -> Dictionary:
 			}
 		tiers.append({
 			"path": path,
-			"exists": exists,
-			"original_text": original_text,
-			"data": read["data"],
+			"exists": read.get("exists", false),
+			"original_text": read.get("original_text", ""),
+			"data": read.get("data", {}),
 		})
 	return {"ok": true, "tiers": tiers}
 
@@ -570,14 +599,15 @@ static func manual_target_details(
 	client: McpClient,
 	server_name: String,
 	fallback_path: String,
+	project_roots: PackedStringArray = PackedStringArray(),
 ) -> Dictionary:
 	if _uses_merge_tiers(client):
-		var project := _load_project_definitions(client, server_name)
+		var project := _load_project_definitions(client, server_name, project_roots)
 		if not project.get("ok", false):
 			return {"ok": false, "error": project.get("error", "Cannot inspect project config tiers")}
 		var project_tiers: Array = project.get("tiers", [])
 		if project_tiers.size() > 1:
-			return {"ok": false, "error": _project_override_message(project_tiers, "update or remove")}
+			return {"ok": false, "error": _project_override_message(project_tiers, "update or remove", client.display_name, server_name)}
 		if project_tiers.size() == 1:
 			var selected_project: Dictionary = project_tiers[0]
 			return {

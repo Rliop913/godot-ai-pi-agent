@@ -38,7 +38,7 @@ func _init() -> void:
 		PackedStringArray(["mcp-servers"]),
 		PackedStringArray(["servers"]),
 	]
-	set("server_key_path_aliases", aliases)
+	server_key_path_aliases = aliases
 	entry_url_field = "url"
 	# pi-codemode-mcp selects stdio from `command` and remote transport from
 	# `url`; it ignores `type`. Keep generated stdio entries minimal and typeless.

@@ -94,10 +94,10 @@ Kimi Code, Pi Agent.
 
 </details>
 
-> **Pi Coding Agent:** review the extension source, then install the pinned commit:
-> `pi install git:github.com/mitsuhiko/pi-codemode-mcp@0ad55d6a8d6eeb44a255903bd10f22eacd72539d`
->
-> To update, review a newer commit and rerun the command with its SHA.
+> **Pi Coding Agent:** Pi has no built-in MCP support. Choose a Pi MCP
+> extension that reads `~/.pi/agent/mcp.json`; see the
+> [Pi package gallery](https://pi.dev/packages) and follow your chosen
+> extension's installation instructions.
 
 Nearly every client is configured with the client-owned `godot-ai attach`
 stdio bridge: the client launches a local command that starts or adopts the

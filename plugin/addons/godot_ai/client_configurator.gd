@@ -249,6 +249,7 @@ static func capture_launch_context() -> Dictionary:
 		"allow_dev_venv": mode_override() != "user",
 		"platform": OS.get_name(),
 		"server_url": "http://127.0.0.1:%d/mcp" % captured_http_port,
+		"project_roots": capture_project_roots(),
 		## The opt-out must ride the attach argv: the client spawns the bridge
 		## (and the bridge its backend) with no editor in the loop, so the
 		## env-injection path in server_lifecycle.gd never runs for them.
@@ -258,6 +259,25 @@ static func capture_launch_context() -> Dictionary:
 	_launch_context_snapshot = context.duplicate(true)
 	_launch_context_snapshot_mutex.unlock()
 	return context
+
+
+## Resolve roots used by cwd-relative client project config tiers while the
+## engine singletons are safe to access. Workers receive this immutable snapshot.
+static func capture_project_roots() -> PackedStringArray:
+	var roots := PackedStringArray()
+	var current_access := DirAccess.open(".")
+	var current_root := "" if current_access == null else current_access.get_current_dir().simplify_path()
+	var project_root := ProjectSettings.globalize_path("res://").simplify_path()
+	for candidate in [current_root, project_root]:
+		var root := str(candidate)
+		if not root.is_empty() and not roots.has(root):
+			roots.append(root)
+	return roots
+
+
+static func _project_roots_from_context(context: Dictionary) -> PackedStringArray:
+	var roots = context.get("project_roots", PackedStringArray())
+	return roots if roots is PackedStringArray else PackedStringArray()
 
 
 ## Read the `godot_ai/allow_remote_hosts` EditorSetting as a canonicalized
@@ -354,13 +374,13 @@ static func configure(id: String, url: String = "", launch_context: Dictionary =
 		if client.command_shape != Client.CommandShape.NONE
 		else {}
 	)
-	var result := _dispatch_configure(client, url, launch)
+	var result := _dispatch_configure(client, url, launch, context)
 	## Trust-but-verify: a strategy may report ok and have actually written the
 	## file, yet the entry is missing/stale on the read-back path — most often
 	## because the user's installed client is reading a different file than
 	## `path_template` resolves to (issue #201). Re-read the live state and
 	## surface a clear error before the dock reports a bogus green dot.
-	return _verify_post_state(client, result, Client.Status.CONFIGURED, url, "configure", launch)
+	return _verify_post_state(client, result, Client.Status.CONFIGURED, url, "configure", launch, context)
 
 
 static func check_status(id: String) -> Client.Status:
@@ -554,8 +574,8 @@ static func remove(id: String, url: String = "", launch_context: Dictionary = {}
 		if client.command_shape != Client.CommandShape.NONE
 		else {}
 	)
-	var result := _dispatch_remove(client)
-	return _verify_post_state(client, result, Client.Status.NOT_CONFIGURED, url, "remove", launch)
+	var result := _dispatch_remove(client, context)
+	return _verify_post_state(client, result, Client.Status.NOT_CONFIGURED, url, "remove", launch, context)
 
 
 ## Resolve config-backed path errors before attach-launch discovery. This both
@@ -570,11 +590,13 @@ static func _config_path_resolution_error(client: Client) -> String:
 
 # --- Strategy dispatch + verify (testable seam) --------------------------
 
-static func _dispatch_configure(client: Client, url: String, launch: Dictionary = {}) -> Dictionary:
+static func _dispatch_configure(
+	client: Client, url: String, launch: Dictionary = {}, launch_context: Dictionary = {}
+) -> Dictionary:
 	launch = launch_for_client(client, launch)
 	match client.config_type:
 		"json":
-			return JsonStrategy.configure(client, SERVER_NAME, url, launch)
+			return JsonStrategy.configure(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
 		"toml":
 			return TomlStrategy.configure(client, SERVER_NAME, url, launch)
 		"yaml":
@@ -583,15 +605,15 @@ static func _dispatch_configure(client: Client, url: String, launch: Dictionary 
 			# #463: fall back to writing the config file directly when the CLI
 			# binary isn't on PATH (Claude Code as a VS Code/Cursor extension).
 			if client.has_json_fallback() and CliStrategy.resolve_cli_path(client).is_empty():
-				return JsonStrategy.configure(client, SERVER_NAME, url, launch)
+				return JsonStrategy.configure(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
 			return CliStrategy.configure(client, SERVER_NAME, url, launch)
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
 
-static func _dispatch_remove(client: Client) -> Dictionary:
+static func _dispatch_remove(client: Client, launch_context: Dictionary = {}) -> Dictionary:
 	match client.config_type:
 		"json":
-			return JsonStrategy.remove(client, SERVER_NAME)
+			return JsonStrategy.remove(client, SERVER_NAME, _project_roots_from_context(launch_context))
 		"toml":
 			return TomlStrategy.remove(client, SERVER_NAME)
 		"yaml":
@@ -600,7 +622,7 @@ static func _dispatch_remove(client: Client) -> Dictionary:
 			# #463: mirror the configure fallback so Remove also works without
 			# the CLI binary — otherwise a fallback-written entry is unremovable.
 			if client.has_json_fallback() and CliStrategy.resolve_cli_path(client).is_empty():
-				return JsonStrategy.remove(client, SERVER_NAME)
+				return JsonStrategy.remove(client, SERVER_NAME, _project_roots_from_context(launch_context))
 			return CliStrategy.remove(client, SERVER_NAME)
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
@@ -629,7 +651,7 @@ static func _dispatch_check_status_with_cli_path_details(
 			var launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
 				launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
-			return JsonStrategy.check_status_details(client, SERVER_NAME, url, launch)
+			return JsonStrategy.check_status_details(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
 		"toml":
 			var launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
@@ -649,7 +671,7 @@ static func _dispatch_check_status_with_cli_path_details(
 			# so it is preferred even when the CLI binary resolves.
 			if client.command_shape != Client.CommandShape.NONE and client.has_json_fallback():
 				var command_launch := _resolved_or_discovered_launch(client, resolved_launch, launch_context)
-				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch)
+				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch, _project_roots_from_context(launch_context))
 			var resolved_cli := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
 			# #463: with no CLI binary, read the JSON fallback config so a
 			# fallback-configured entry reports CONFIGURED instead of red.
@@ -657,7 +679,7 @@ static func _dispatch_check_status_with_cli_path_details(
 				var fallback_launch := {}
 				if client.command_shape != Client.CommandShape.NONE:
 					fallback_launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
-				return JsonStrategy.check_status_details(client, SERVER_NAME, url, fallback_launch)
+				return JsonStrategy.check_status_details(client, SERVER_NAME, url, fallback_launch, _project_roots_from_context(launch_context))
 			var cli_launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
 				cli_launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
@@ -687,11 +709,12 @@ static func _verify_post_state(
 	url: String,
 	action: String,
 	resolved_launch: Dictionary = {},
+	launch_context: Dictionary = {},
 ) -> Dictionary:
 	if result.get("status") != "ok":
 		return result
 	var actual := _dispatch_check_status_with_cli_path_details(
-		client, url, "", {}, resolved_launch
+		client, url, "", launch_context, resolved_launch
 	).get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
 		return result
@@ -727,6 +750,7 @@ static func manual_command(id: String) -> String:
 		server_url_from(context),
 		str(path_resolution.get("path", "")),
 		launch,
+		_project_roots_from_context(context),
 	)
 	if cmd.is_empty():
 		return cmd

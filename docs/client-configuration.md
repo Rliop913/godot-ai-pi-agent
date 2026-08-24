@@ -68,20 +68,6 @@ Per-strategy command rendering (`CommandShape` docs in `_base.gd`):
   working directory, the dock identifies plausible overrides but fails closed
   with the exact path instead of mutating an inferred project root.
 
-### Pi Agent code-mode call syntax
-
-`pi-codemode-mcp` keeps the MCP server name separate from the tool or resource
-name. Pass bare catalog names in the second argument:
-
-```javascript
-await call("godot-ai", "editor_state", {});
-await readResource("godot-ai", "godot://scene/current");
-```
-
-Do not call `godot-ai/editor_state`, `godot-ai/get_editor_state`, or
-`godot-ai/get_current_scene`. The `godot-ai/` prefix does not belong in the
-second argument, and the `get_*` forms are not registered tools. Use
-`listTools("editor_state")` when unsure of the current catalog name.
 - **CLI** — `cli_register_template` uses the whole-element tokens
   `{command}` / `{args...}` (Claude Code:
   `mcp add --scope user {name} -- {command} {args...}`). Status for
