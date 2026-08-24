@@ -593,6 +593,41 @@ func test_drift_banner_clears_after_per_row_reconfigure() -> void:
 		"Cache must drop the now-green client so a follow-up Reconfigure-mismatched click is a no-op")
 
 
+func test_successful_configure_discloses_the_scope_sweep_on_the_row() -> void:
+	## #877: `_show_manual_command_for` — the only thing that reveals the panel
+	## listing the pre-cleanup removes — is called just once, on the Configure
+	## FAILURE branch. So a successful Configure cleared `godot-ai` out of every
+	## scope, including a .mcp.json in whatever directory the editor happened to
+	## be launched from, and told the user nothing. The green row carries that.
+	_dock._build_ui()
+	assert_true(_dock._client_rows.has("claude_code"),
+		"claude_code is a static registry entry and must have a row")
+	if not _dock._client_rows.has("claude_code"):
+		return
+	var row: Dictionary = _dock._client_rows["claude_code"]
+	var note := McpClientConfigurator.configure_sweep_note("claude_code")
+	assert_false(note.is_empty(), "claude_code is the scope-sweeping descriptor")
+
+	_dock._apply_row_status("claude_code", McpClient.Status.CONFIGURED, note)
+	var label := (row["name_label"] as Label).text
+	assert_contains(label, note,
+		"a successful configure must disclose the sweep it just performed")
+	assert_contains(label, "project",
+		"the destructive pass is the project one — the row has to name it")
+	assert_eq((row["dot"] as ColorRect).color, Color.GREEN,
+		"the note is a disclosure on a healthy row, not a warning state")
+
+	## Transient by design: the next status refresh re-applies CONFIGURED with
+	## no detail, so the row settles back to its plain name rather than pinning
+	## a note that no longer describes anything that just happened.
+	_dock._apply_row_status("claude_code", McpClient.Status.CONFIGURED)
+	assert_eq(
+		(row["name_label"] as Label).text,
+		McpClientConfigurator.client_display_name("claude_code"),
+		"the note must not survive an ordinary status refresh",
+	)
+
+
 func test_focus_in_auto_refresh_is_enabled_with_async_cooldown() -> void:
 	## Focus-in should still refresh client status, but the refresh path must be
 	## async/cooldown-protected so it does not run blocking CLI checks on the

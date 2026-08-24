@@ -672,7 +672,7 @@ static func _dispatch_check_status_with_cli_path_details(
 			if (
 				client.command_shape != Client.CommandShape.NONE
 				and client.has_json_fallback()
-				and not _scope_diverges_from_json_fallback(client, cli_path)
+				and not _scope_diverges_from_json_fallback(client)
 			):
 				var command_launch := _resolved_or_discovered_launch(client, resolved_launch, launch_context)
 				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch)
@@ -754,18 +754,20 @@ static func _note_unhonoured_scope(client: Client, result: Dictionary) -> Dictio
 ## detection — a stdout scan sees the command, not the full argv — which is the
 ## documented trade for a status that is merely coarse instead of wrong.
 ##
-## Ordering matters: the token check and the scope compare both short-circuit
-## for every non-`{scope}` descriptor and for the default user scope, so the
-## PATH walk only runs when the answer can actually be true. An unresolvable
-## CLI means configure took the #463 JSON fallback, which writes user scope
-## whatever the setting says — so the file is the right thing to read again.
-static func _scope_diverges_from_json_fallback(client: Client, cli_path: String) -> bool:
+## Deliberately says nothing about whether the CLI resolves (#879). An earlier
+## version walked PATH here and returned false for an unresolvable binary, on
+## the reasoning that configure would then have taken the #463 JSON fallback —
+## which writes user scope whatever the setting says — so the file was the
+## right thing to read again. That extra clause could not change any outcome:
+## this is only consulted from the one call site below, already guarded on
+## `has_json_fallback()`, and when the CLI does not resolve the very next
+## branch (`resolved_cli.is_empty() and client.has_json_fallback()`) takes the
+## fallback read anyway. All it bought was a second full `McpCliFinder.find`
+## sweep per status check, on top of the one that immediately follows.
+static func _scope_diverges_from_json_fallback(client: Client) -> bool:
 	if not CliStrategy.uses_scope_token(client):
 		return false
-	if McpSettings.client_scope() == McpSettings.DEFAULT_CLIENT_SCOPE:
-		return false
-	var resolved := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
-	return not resolved.is_empty()
+	return McpSettings.client_scope() != McpSettings.DEFAULT_CLIENT_SCOPE
 
 
 static func _resolved_or_discovered_launch(
@@ -793,13 +795,13 @@ static func _verify_post_state(
 ) -> Dictionary:
 	if result.get("status") != "ok":
 		return result
-	var actual := _dispatch_check_status_with_cli_path_details(
+	var details := _dispatch_check_status_with_cli_path_details(
 		client, url, "", {}, resolved_launch
-	).get("status", Client.Status.NOT_CONFIGURED)
+	)
+	var actual := details.get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
 		return result
-	var path := client.resolved_config_path()
-	var path_hint := "" if path.is_empty() else " Inspect %s and remove the godot-ai entry by hand if needed." % path
+	var path_hint := _post_state_path_hint(client, str(details.get("resolved_scope", "")))
 	return {
 		"status": "error",
 		"message": "%s reported %s ok but verification still reads %s (expected %s).%s" % [
@@ -808,6 +810,63 @@ static func _verify_post_state(
 			path_hint,
 		],
 	}
+
+
+## Where to send the user when verification finds an entry that should not be
+## there. `resolved_config_path()` is `path_template` — right only for the
+## default user scope. Naming ~/.claude.json for a project-scope survivor sends
+## them to a file with nothing in it, which is worse than naming no file at all
+## (#879). The scope probe supplies `resolved_scope`; `path_template` has no
+## project-relative token (see `_note_unhonoured_scope`), so the project case is
+## described rather than resolved to a path.
+static func _post_state_path_hint(client: Client, resolved_scope: String) -> String:
+	match resolved_scope:
+		"project":
+			return (
+				" The surviving entry is project-scoped: inspect the .mcp.json in the"
+				+ " directory the editor was launched from and remove the godot-ai entry"
+				+ " by hand if needed."
+			)
+		"local":
+			var local_path := client.resolved_config_path()
+			if local_path.is_empty():
+				return ""
+			return (
+				" The surviving entry is local-scoped: inspect the block for the"
+				+ " directory the editor was launched from in %s and remove the"
+				+ " godot-ai entry by hand if needed."
+			) % local_path
+		_:
+			var path := client.resolved_config_path()
+			if path.is_empty():
+				return ""
+			return " Inspect %s and remove the godot-ai entry by hand if needed." % path
+
+
+## #877: Configure's first act is the all-scope pre-cleanup — it deletes the
+## `godot-ai` entry from every scope the descriptor can write to, including a
+## `.mcp.json` resolved against the CLI's working directory, which need not be
+## this project's folder. The manual-command panel that spells those removes
+## out is only shown when Configure FAILS (`mcp_dock.gd`), so on the success
+## path — the one where the sweep actually ran — this note is its only
+## disclosure. Empty for descriptors without a scope token: their single
+## implicit pass removes exactly the entry the register is about to rewrite,
+## which needs no warning (the same rule `_sweep_caveat` applies).
+##
+## "attempted", not "cleared": `CliStrategy.configure` discards every
+## pre-cleanup result, and `mcp remove` exits non-zero for an absent entry as
+## well as for a real failure, so a timed-out or failed remove leaves the scope
+## untouched while the register still returns ok. The note names what ran,
+## not what it can prove.
+static func configure_sweep_note(id: String) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null or client.config_type != "cli":
+		return ""
+	if client.cli_unregister_template.is_empty() or not CliStrategy.uses_scope_token(client):
+		return ""
+	return "attempted to clear %s from %s" % [
+		SERVER_NAME, ", ".join(CliStrategy.cleanup_scopes(client)),
+	]
 
 
 static func manual_command(id: String) -> String:

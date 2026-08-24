@@ -4,6 +4,8 @@ extends McpTestSuite
 ## #816 rollout steps 5-6: launch discovery plus Codex's TOML command shape.
 
 var _scratch_dir: String
+var _had_client_scope_setting := false
+var _saved_client_scope: Variant = null
 
 
 func suite_name() -> String:
@@ -13,11 +15,41 @@ func suite_name() -> String:
 func suite_setup(_ctx: Dictionary) -> void:
 	_scratch_dir = OS.get_user_data_dir().path_join("mcp_attach_client_tests")
 	DirAccess.make_dir_recursive_absolute(_scratch_dir)
+	## #876: `_claude_cli_clone` copies the real descriptor's
+	## `cli_register_template`, which carries `{scope}` since #872 — so this
+	## suite's fixtures report `uses_scope_token() == true` and become
+	## sensitive to `godot_ai/mcp_client_scope`, a setting it never opts into.
+	## At `project`/`local` that flips `_scope_diverges_from_json_fallback`,
+	## skipping the JSON read these tests exist to prove is authoritative.
+	## Pin the default for the run so the suite is hermetic against whatever
+	## the developer has selected, and restore their value in teardown.
+	##
+	## Presence is tracked separately from value, following test_allow_hosts.gd
+	## and test_dock.gd's `_restore_mcp_logging_setting`: writing the default
+	## back into a key that was absent would leave the suite having *created*
+	## an EditorSetting. `plugin.gd._enter_tree` calls
+	## `ClientConfigurator.ensure_settings_registered()`, so in a live editor
+	## the key always exists by the time tests run and the absent branch is
+	## unreachable — but a restore helper that only round-trips in the state it
+	## happens to meet is the kind that breaks silently when that changes.
+	var es := EditorInterface.get_editor_settings()
+	if es != null:
+		_had_client_scope_setting = es.has_setting(McpSettings.SETTING_CLIENT_SCOPE)
+		if _had_client_scope_setting:
+			_saved_client_scope = es.get_setting(McpSettings.SETTING_CLIENT_SCOPE)
+		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, McpSettings.DEFAULT_CLIENT_SCOPE)
 
 
 func suite_teardown() -> void:
 	for file_name in DirAccess.get_files_at(_scratch_dir):
 		DirAccess.remove_absolute(_scratch_dir.path_join(file_name))
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		return
+	if _had_client_scope_setting:
+		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, _saved_client_scope)
+	elif es.has_setting(McpSettings.SETTING_CLIENT_SCOPE):
+		es.erase(McpSettings.SETTING_CLIENT_SCOPE)
 
 
 func test_codex_descriptor_declares_attach_shape_and_timeouts() -> void:

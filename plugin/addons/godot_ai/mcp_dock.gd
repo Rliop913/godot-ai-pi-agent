@@ -2152,7 +2152,14 @@ func _apply_client_action_result(client_id: String, action: String, result: Dict
 
 	var success_status := Client.Status.NOT_CONFIGURED if action == "remove" else Client.Status.CONFIGURED
 	if result.get("status") == "ok":
-		_apply_row_status(client_id, success_status)
+		## #877: Remove targets only the selected scope, so a configure is the
+		## only action with an all-scope sweep to disclose. The manual panel
+		## that lists those removes is shown on the failure path below, which
+		## left the success path — where the sweep actually ran — silent.
+		var sweep_note := (
+			ClientConfigurator.configure_sweep_note(client_id) if action == "configure" else ""
+		)
+		_apply_row_status(client_id, success_status, sweep_note)
 		var row: Dictionary = _client_rows.get(client_id, {})
 		if not row.is_empty():
 			(row["manual_panel"] as VBoxContainer).visible = false
@@ -3363,7 +3370,13 @@ func _apply_row_status(
 			dot.color = Color.GREEN
 			configure_btn.text = "Reconfigure"
 			remove_btn.visible = true
-			name_label.text = base_name
+			## `error_msg` doubles as a detail slot on the green path: a
+			## successful configure passes the sweep note (#877). Transient by
+			## design — the next status refresh re-applies CONFIGURED with no
+			## detail, so the row settles back to its plain name.
+			name_label.text = (
+				"%s  (%s)" % [base_name, error_msg] if not error_msg.is_empty() else base_name
+			)
 		Client.Status.NOT_CONFIGURED:
 			dot.color = COLOR_MUTED
 			configure_btn.text = "Configure"

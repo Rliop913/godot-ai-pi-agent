@@ -18,7 +18,12 @@ func _init() -> void:
 		["mcp", "add", "--scope", "{scope}", "{name}", "--", "{command}", "{args...}"]
 	)
 	## Explicit scope: an unscoped `mcp remove` deletes from whichever scope
-	## matches first, which could eat a project-local entry the user made.
+	## matches first, so the flag keeps each removal aimed at one known place.
+	## Note what that does and does not protect (#877): the dock's **Remove**
+	## button runs this once, at the selected scope only. **Configure** runs it
+	## once per scope in `CLIENT_SCOPES` before registering, so a Configure at
+	## any setting does delete a `godot-ai` entry from <cwd>/.mcp.json if one is
+	## there — see the cwd caveat below for which directory that actually is.
 	cli_unregister_template = PackedStringArray(["mcp", "remove", "--scope", "{scope}", "{name}"])
 	## Scope caveat: `--scope project` resolves `.mcp.json` against the
 	## *spawned CLI's* working directory, which is whatever the editor process
@@ -48,13 +53,17 @@ func _init() -> void:
 	## (verified live against claude CLI in an isolated CLAUDE_CONFIG_DIR):
 	##   "godot-ai": { "type": "stdio", "command": "<cmd>", "args": [...], "env": {} }
 	## The fallback writer omits the empty `env`; the verifier accepts both.
-	## Status always reads this file — it is the CLI's own store for user
-	## scope, and file reads give exact launch-drift detection that `mcp list`
-	## stdout scanning cannot.
+	## Status reads this file only while the selected scope is still `user` —
+	## it is the CLI's own store for that scope, and file reads give exact
+	## launch-drift detection that `mcp list` stdout scanning cannot. At
+	## `project`/`local` the entry is somewhere `path_template` cannot see, so
+	## `_scope_diverges_from_json_fallback` (client_configurator.gd) routes
+	## status to `cli_scope_status_template` instead and this file is not read.
 	path_template = {"unix": "~/.claude.json", "windows": "~/.claude.json"}
 	server_key_path = PackedStringArray(["mcpServers"])
 	## URL-mode shape, used only for the manual-instruction fallback text —
-	## `claude mcp add --scope user --transport http` writes {type: http, url}.
+	## `claude mcp add --scope <scope> --transport http` writes {type: http, url},
+	## where <scope> is whatever `godot_ai/mcp_client_scope` resolves to.
 	entry_extra_fields = {"type": "http"}
 	command_shape = McpClient.CommandShape.FLAT
 	command_transport_key = "type"

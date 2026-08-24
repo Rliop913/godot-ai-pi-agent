@@ -123,6 +123,20 @@ clears `godot-ai` out of every scope before writing the new one, so the old
 entry doesn't linger. **Remove**, by contrast, only targets the scope that is
 currently selected, so switch back before removing if you changed the setting.
 
+> [!IMPORTANT]
+> That clearing step runs at **every** setting, including the default `user`.
+> One of its passes is `claude mcp remove --scope project godot-ai`, which
+> rewrites the `.mcp.json` in the client CLI's working directory — see the
+> first caveat below for why that is not necessarily this project's folder. If
+> a repository keeps a hand-maintained `godot-ai` entry in a checked-in
+> `.mcp.json`, pressing **Configure** deletes that entry and leaves the file
+> dirty. Only a key named `godot-ai` is touched; other servers are left in
+> place. After a successful **Configure** the client's row names the scopes it
+> attempted to clear (the remove results are not checked, so a scope can be
+> listed without its removal having succeeded); if Configure fails, the dock's
+> "Run this manually" text lists these removes alongside the register line so
+> you can run them yourself.
+
 Two caveats for `project` scope:
 
 - The client CLI resolves the project config against **its own working
