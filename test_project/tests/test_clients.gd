@@ -16,8 +16,20 @@ var _scratch_dir: String
 ## Snapshot the user's live port overrides at suite entry so our
 ## per-test set/clear dance doesn't leave the editor pointing at the wrong
 ## port if a test fails mid-flight.
+##
+## Presence is tracked alongside value for each key: a `null` snapshot means
+## "no such setting", and writing the default back into it would leave the
+## suite having *created* an EditorSetting it found absent. Same idiom as
+## test_allow_hosts.gd and test_dock.gd's `_restore_mcp_logging_setting`.
+var _had_http_port_setting := false
 var _saved_http_port: Variant = null
+var _had_ws_port_setting := false
 var _saved_ws_port: Variant = null
+## Same reason as the ports: these tests drive godot_ai/mcp_client_scope
+## through its valid and invalid values and must not leave the editor
+## registering at a scope the user never chose.
+var _had_client_scope_setting := false
+var _saved_client_scope: Variant = null
 
 
 func suite_name() -> String:
@@ -30,10 +42,15 @@ func suite_setup(_ctx: Dictionary) -> void:
 	DirAccess.make_dir_recursive_absolute(_scratch_dir)
 	var es := EditorInterface.get_editor_settings()
 	if es != null:
-		if es.has_setting(McpSettings.SETTING_HTTP_PORT):
+		_had_http_port_setting = es.has_setting(McpSettings.SETTING_HTTP_PORT)
+		if _had_http_port_setting:
 			_saved_http_port = es.get_setting(McpSettings.SETTING_HTTP_PORT)
-		if es.has_setting(McpClientConfigurator.SETTING_WS_PORT):
+		_had_ws_port_setting = es.has_setting(McpClientConfigurator.SETTING_WS_PORT)
+		if _had_ws_port_setting:
 			_saved_ws_port = es.get_setting(McpClientConfigurator.SETTING_WS_PORT)
+		_had_client_scope_setting = es.has_setting(McpSettings.SETTING_CLIENT_SCOPE)
+		if _had_client_scope_setting:
+			_saved_client_scope = es.get_setting(McpSettings.SETTING_CLIENT_SCOPE)
 
 
 func suite_teardown() -> void:
@@ -1595,6 +1612,36 @@ func _make_cli_json_fallback_client(path: String) -> McpClient:
 	return c
 
 
+## A command-shape CLI descriptor that takes `{scope}`, shaped like
+## claude_code but pointed at a scratch file. Used to exercise the scope-aware
+## status routing without touching the user's real ~/.claude.json.
+func _make_scope_cli_client(path: String) -> McpClient:
+	var c := McpClient.new()
+	c.id = "scope_cli_test"
+	c.display_name = "Scope CLI Test"
+	c.config_type = "cli"
+	# Never resolves on PATH, so the CLI probe spawn-fails deterministically.
+	c.cli_names = PackedStringArray(["godot-ai-nonexistent-cli-xyz"])
+	c.cli_register_template = PackedStringArray(
+		["mcp", "add", "--scope", "{scope}", "{name}", "--", "{command}", "{args...}"]
+	)
+	c.cli_unregister_template = PackedStringArray(["mcp", "remove", "--scope", "{scope}", "{name}"])
+	c.cli_status_args = PackedStringArray(["mcp", "list"])
+	## #878: without this the dispatch gate in client_configurator.gd is
+	## unreachable from any test, so `check_scope_status_details` never runs —
+	## a full suite spawned `mcp list` three times and `mcp get` zero times.
+	## Mirrors claude_code.gd so the fixture routes the way the real descriptor
+	## does; `mcp get` also renders differently from `cli_status_args`, which is
+	## what lets a test notice if the two are ever swapped.
+	c.cli_scope_status_template = PackedStringArray(["mcp", "get", "{name}"])
+	c.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	c.server_key_path = PackedStringArray(["mcpServers"])
+	c.command_shape = McpClient.CommandShape.FLAT
+	c.command_transport_key = "type"
+	c.command_transport_value = "stdio"
+	return c
+
+
 func test_has_json_fallback_semantics() -> void:
 	var path := _scratch_dir.path_join("fallback_sem.json")
 	var with_fallback := _make_cli_json_fallback_client(path)
@@ -1618,7 +1665,7 @@ func test_claude_code_has_claude_json_fallback() -> void:
 
 
 func test_claude_code_declares_stdio_attach_registration() -> void:
-	## #838: registration goes through `claude mcp add --scope user <name> --
+	## #838: registration goes through `claude mcp add --scope <scope> <name> --
 	## <command> <args...>` (stdio is the CLI's default transport; verified
 	## live in an isolated CLAUDE_CONFIG_DIR). The JSON fallback file renders
 	## the same entry the CLI itself writes: type:stdio + command + args.
@@ -1629,7 +1676,8 @@ func test_claude_code_declares_stdio_attach_registration() -> void:
 	assert_true(client.command_legacy_keys.has("url"), "legacy HTTP entry's url must be removed")
 	assert_true(client.command_supports_url_fallback)
 	var register := client.cli_register_template
-	assert_true(register.has("--scope"), "registration stays user-scoped")
+	assert_true(register.has("--scope"), "registration must stay explicitly scoped")
+	assert_true(register.has("{scope}"), "scope comes from the setting, not a hardcoded value")
 	assert_true(register.has("--"), "`--` must stop claude's own flag parsing")
 	assert_true(register.has("{command}"), "register template must take the launch command token")
 	assert_true(register.has("{args...}"), "register template must splice the launch args")
@@ -1641,6 +1689,410 @@ func test_claude_code_declares_stdio_attach_registration() -> void:
 	assert_eq(args_index, command_index + 1, "{args...} must immediately follow {command}")
 	assert_false(register.has("--transport"), "stdio is the default transport — no pin in argv")
 	assert_true(client.cli_unregister_template.has("--scope"), "unscoped remove could eat a project-local entry")
+	assert_true(client.cli_unregister_template.has("{scope}"),
+		"remove must target the same scope the register wrote to")
+
+
+func test_client_scope_defaults_to_user() -> void:
+	## Existing installs must keep registering where they always have; the
+	## setting is opt-in, not a silent behaviour change on upgrade.
+	var es := EditorInterface.get_editor_settings()
+	if es != null and es.has_setting(McpSettings.SETTING_CLIENT_SCOPE):
+		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, McpSettings.DEFAULT_CLIENT_SCOPE)
+	assert_eq(McpSettings.client_scope(), "user")
+	var client := McpClientRegistry.get_by_id("claude_code")
+	var args := McpCliStrategy.format_args(
+		client.cli_register_template, "godot-ai", "", {"command": "uvx", "args": ["godot-ai"]}
+	)
+	var scope_index := args.find("--scope")
+	assert_true(scope_index >= 0, "register argv must carry --scope")
+	assert_eq(args[scope_index + 1], "user", "default scope must render as user")
+	assert_false(args.has("{scope}"), "the token must be substituted, never passed through to the CLI")
+
+
+func test_client_scope_project_renders_in_argv() -> void:
+	## The whole point of the setting: `project` makes the CLI write
+	## <project>/.mcp.json instead of the global ~/.claude.json block.
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		skip("EditorSettings unavailable in test environment")
+		return
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "project")
+	assert_eq(McpSettings.client_scope(), "project")
+	var client := McpClientRegistry.get_by_id("claude_code")
+	var register := McpCliStrategy.format_args(
+		client.cli_register_template, "godot-ai", "", {"command": "uvx", "args": ["godot-ai"]}
+	)
+	var reg_index := register.find("--scope")
+	assert_true(reg_index >= 0, "register argv must carry --scope")
+	assert_eq(register[reg_index + 1], "project")
+	## Remove must follow the same scope, or Configure-then-Remove leaves the
+	## entry behind in whichever scope the register actually wrote.
+	var unregister := McpCliStrategy.format_args(client.cli_unregister_template, "godot-ai", "")
+	var unreg_index := unregister.find("--scope")
+	assert_true(unreg_index >= 0, "unregister argv must carry --scope")
+	assert_eq(unregister[unreg_index + 1], "project")
+	_restore_client_scope()
+
+
+func test_client_scope_rejects_unknown_value() -> void:
+	## A hand-edited editor_settings-4.tres must not make the plugin shell out
+	## with a bad --scope flag; fall back to the default instead.
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		skip("EditorSettings unavailable in test environment")
+		return
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "not-a-scope")
+	assert_eq(McpSettings.client_scope(), McpSettings.DEFAULT_CLIENT_SCOPE)
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "  PROJECT  ")
+	assert_eq(McpSettings.client_scope(), "project", "value should be trimmed and case-folded")
+	_restore_client_scope()
+
+
+func test_client_scope_pre_cleanup_sweeps_every_scope() -> void:
+	## #872: flipping the setting and pressing Configure must not strand the
+	## entry the previous scope wrote — that is precisely the "loaded in every
+	## unrelated workspace" problem the setting exists to fix. The pre-cleanup
+	## therefore removes from all CLIENT_SCOPES, not just the selected one.
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	assert_true(McpCliStrategy.uses_scope_token(client), "claude_code register template takes {scope}")
+	var swept := McpCliStrategy._cleanup_scopes(client)
+	for scope in McpSettings.CLIENT_SCOPES:
+		assert_true(swept.has(String(scope)), "pre-cleanup must sweep the %s scope" % scope)
+	## A descriptor without the token keeps its single pass, so opting into
+	## `{scope}` is what costs the extra subprocess spawns — nothing else
+	## changes. claude_code is currently the only registered cli client, so
+	## the negative case uses the synthetic descriptor rather than a dead
+	## `if config_type == "cli"` branch that would pass with zero assertions.
+	var plain := _make_cli_json_fallback_client(_scratch_dir.path_join("cleanup_scopes.json"))
+	assert_false(McpCliStrategy.uses_scope_token(plain), "descriptor without the token must not opt in")
+	var plain_scopes := McpCliStrategy._cleanup_scopes(plain)
+	assert_eq(plain_scopes.size(), 1, "non-scope clients keep one pass")
+	assert_eq(plain_scopes[0], "", "the single pass resolves the scope normally")
+
+
+func test_project_scope_status_leaves_the_user_scope_file() -> void:
+	## #872 blocker: `--scope project` writes <cwd>/.mcp.json and `--scope
+	## local` writes a per-project block, neither of which is the file
+	## `path_template` resolves to. A status path that keeps reading the
+	## user-scope file makes _verify_post_state turn every successful
+	## project-scope Configure into "configure ok but verification still reads
+	## Not configured", and pins the dock row red.
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		skip("EditorSettings unavailable in test environment")
+		return
+	var path := _scratch_dir.path_join("scope_status.json")
+	_remove_if_exists(path)
+	var client := _make_scope_cli_client(path)
+	var launch := {"ok": true, "command": "uvx", "args": ["godot-ai", "attach"]}
+	## Seed the user-scope file through the strategy that actually writes it,
+	## so the entry is in exactly the shape the verifier accepts and a JSON
+	## read-back would report CONFIGURED.
+	var seeded := McpJsonStrategy.configure(client, "godot-ai", "", launch)
+	assert_eq(seeded.get("status"), "ok", "seed write should succeed: %s" % seeded.get("message", ""))
+
+	## Passing cli_path explicitly is what makes the divergence real without
+	## depending on a `claude` binary existing on this machine. It never
+	## resolves, so the CLI probe spawn-fails rather than reporting CONFIGURED.
+	var fake_cli := "godot-ai-nonexistent-cli-xyz"
+
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, McpSettings.DEFAULT_CLIENT_SCOPE)
+	var at_user := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", fake_cli, {}, launch
+	)
+	assert_eq(at_user.get("status"), McpClient.Status.CONFIGURED,
+		"user scope must keep reading the JSON fallback file for exact drift detection")
+
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "project")
+	var at_project := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", fake_cli, {}, launch
+	)
+	assert_ne(at_project.get("status"), McpClient.Status.CONFIGURED,
+		"project scope must not verify against the user-scope file it never wrote")
+
+	## With no CLI to run the register, Configure falls back to the #463 JSON
+	## writer, which is user-scoped whatever the setting says — so the file is
+	## the correct thing to read again even at project scope.
+	var at_project_no_cli := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", "", {}, launch
+	)
+	assert_eq(at_project_no_cli.get("status"), McpClient.Status.CONFIGURED,
+		"without a CLI the JSON fallback owns both the write and the read-back")
+	_restore_client_scope()
+	_remove_if_exists(path)
+
+
+## A fake CLI that records its argv to `argv_log` and prints whatever is in
+## `probe_stdout.txt`, so the scope probe's SUBPROCESS wrapper
+## (`check_scope_status_details`) and the dispatch gate that reaches it run for
+## real without a `claude` binary on the machine (#878). Windows gets a .bat —
+## McpCliExec wraps those in `cmd.exe /c`; elsewhere a shebang script chmod 0755.
+## Approach adapted from @dsarno's #881, which was closed unmerged.
+func _write_fake_probe_cli(stdout_fixture: String, argv_log: String) -> String:
+	var out_path := _scratch_dir.path_join("probe_stdout.txt")
+	_write_text(out_path, stdout_fixture)
+	if OS.get_name() == "Windows":
+		var bat := _scratch_dir.path_join("fake_scope_cli.bat")
+		## Backslashes are load-bearing. `user://` paths come back with forward
+		## slashes and cmd.exe's `type` cannot open one — it exits 1 with "The
+		## system cannot find the file specified" and prints nothing, which
+		## reaches the probe as empty stdout and a NOT_CONFIGURED verdict for
+		## entirely the wrong reason. Verified both ways before relying on it.
+		var bat_body := (
+			"@echo off\r\n"
+			+ "echo %%* > \"%s\"\r\n" % argv_log.replace("/", "\\")
+			+ "type \"%s\"\r\n" % out_path.replace("/", "\\")
+		)
+		_write_text(bat, bat_body)
+		return bat
+	var sh := _scratch_dir.path_join("fake_scope_cli.sh")
+	var sh_body := (
+		"#!/bin/sh\n"
+		+ "printf '%%s ' \"$@\" > \"%s\"\n" % argv_log
+		+ "cat \"%s\"\n" % out_path
+	)
+	_write_text(sh, sh_body)
+	var exec_mode := (
+		FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER
+		| FileAccess.UNIX_READ_GROUP | FileAccess.UNIX_EXECUTE_GROUP
+		| FileAccess.UNIX_READ_OTHER | FileAccess.UNIX_EXECUTE_OTHER
+	)
+	assert_eq(FileAccess.set_unix_permissions(sh, exec_mode), OK, "test setup: chmod 0755")
+	return sh
+
+func test_scope_probe_dispatch_uses_its_own_template_and_the_selected_scope() -> void:
+	## #878: until this test nothing set `cli_scope_status_template`, so the
+	## probe gate in _dispatch_check_status_with_cli_path_details was unreachable
+	## from the suite — a full run spawned `mcp get` zero times — and two
+	## mutations survived it:
+	##   1. client_configurator.gd passing DEFAULT_CLIENT_SCOPE to the probe
+	##      instead of the live setting;
+	##   2. _cli_strategy.gd probing with `cli_status_args` instead of
+	##      `cli_scope_status_template`.
+	## Asserting on rendered templates does NOT catch either — the mutations
+	## change which template the probe *passes* and which scope it *compares*,
+	## neither of which a direct format_args() call observes. Both are verified
+	## dead by mutating those two lines and watching this test fail.
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		skip("EditorSettings unavailable in test environment")
+		return
+	var argv_log := _scratch_dir.path_join("probe_argv.log")
+	_remove_if_exists(argv_log)
+	var cli := _write_fake_probe_cli(_PROBE_USER, argv_log)
+	var client := _make_scope_cli_client(_scratch_dir.path_join("probe_route.json"))
+	var launch := {"ok": true, "command": _PROBE_TARGET, "args": []}
+
+	## The fake CLI prints a USER-scope entry. Under a `project` selection that
+	## must read as mismatch — mutation 1 (expected scope hardcoded to the
+	## default) would call this the ordinary green path.
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "project")
+	var at_project := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", cli, {}, launch
+	)
+	assert_eq(at_project.get("status"), McpClient.Status.CONFIGURED_MISMATCH,
+		"a user-scope entry under a project selection must read as mismatch")
+	assert_contains(str(at_project.get("error_msg", "")), "user scope, not project")
+	assert_eq(at_project.get("resolved_scope"), "user",
+		"the mismatch verdict must carry the resolved scope as data, not only prose (#879)")
+
+	## The spawned argv must come from cli_scope_status_template (`mcp get`),
+	## not cli_status_args (`mcp list`) — mutation 2.
+	var logged := _read_text(argv_log)
+	assert_contains(logged, "get")
+	assert_contains(logged, "godot-ai")
+	assert_false(logged.contains("list"),
+		"probe must render cli_scope_status_template, got argv: %s" % logged)
+
+	## A different selection moves only the expected side of the comparison,
+	## proving the live setting is threaded through rather than a constant.
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "local")
+	var at_local := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", cli, {}, launch
+	)
+	assert_eq(at_local.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	assert_contains(str(at_local.get("error_msg", "")), "user scope, not local")
+
+	## And the green path through the same subprocess: swap the canned output to
+	## a project-scope entry and re-probe at project scope.
+	_write_text(_scratch_dir.path_join("probe_stdout.txt"), _PROBE_PROJECT)
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "project")
+	var matching := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", cli, {}, launch
+	)
+	assert_eq(matching.get("status"), McpClient.Status.CONFIGURED,
+		"a project-scope entry under a project selection is the ordinary green path")
+	_restore_client_scope()
+	_remove_if_exists(argv_log)
+
+
+## Real `claude mcp get godot-ai` output, captured from claude 2.1.241 in an
+## isolated CLAUDE_CONFIG_DIR. Recorded verbatim so the parser is tested
+## against what the CLI actually prints rather than an idealised shape.
+const _PROBE_USER := """godot-ai:
+  Scope: User config (available in all your projects)
+  Status: ✘ Failed to connect
+  Issue: -32000: MCP error -32000: Connection closed
+  Type: stdio
+  Command: C:/Program Files/Git/usr/bin/true
+  Args: --flag
+  Environment:
+"""
+
+const _PROBE_PROJECT := """godot-ai:
+  Scope: Project config (shared via .mcp.json)
+  Status: ⏸ Pending approval (run `claude` to approve)
+  Type: stdio
+  Command: C:/Program Files/Git/usr/bin/true
+  Args: --p
+  Environment:
+"""
+
+const _PROBE_LOCAL := """godot-ai:
+  Scope: Local config (private to you in this project)
+  Status: ✘ Failed to connect
+  Type: stdio
+  Command: C:/Program Files/Git/usr/bin/true
+  Args: --l
+  Environment:
+"""
+
+const _PROBE_TARGET := "C:/Program Files/Git/usr/bin/true"
+
+
+func test_scope_probe_parses_real_cli_scope_labels() -> void:
+	## The parser matches the first word after "Scope:", so the parenthetical
+	## blurb can be reworded by a future CLI release without breaking us.
+	assert_eq(McpCliStrategy._scope_from_probe_output(_PROBE_USER), "user")
+	assert_eq(McpCliStrategy._scope_from_probe_output(_PROBE_PROJECT), "project")
+	assert_eq(McpCliStrategy._scope_from_probe_output(_PROBE_LOCAL), "local")
+	assert_eq(McpCliStrategy._scope_from_probe_output("no scope line here"), "",
+		"an unrecognisable probe must report empty, not guess a scope")
+
+
+func test_scope_probe_verdict_flags_entry_resolved_from_another_scope() -> void:
+	## The bug this exists to catch: `mcp list` prints a leftover user-scope
+	## entry with our exact command, so a name+target scan calls an EMPTY
+	## project scope CONFIGURED — a green dot over the "loaded in every
+	## workspace" state the setting exists to end. Verified against claude
+	## 2.1.241, where the user entry does win the resolve.
+	var wrong_scope := McpCliStrategy._scope_probe_verdict(
+		0, _PROBE_USER, "project", _PROBE_TARGET
+	)
+	assert_eq(wrong_scope.get("status"), McpClient.Status.CONFIGURED_MISMATCH,
+		"an entry resolved from user scope is not a configured project scope")
+	assert_contains(str(wrong_scope.get("error_msg", "")), "user",
+		"the row message should name the scope that actually resolved")
+
+	## Same output, matching selection — this is the ordinary green path.
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(0, _PROBE_USER, "user", _PROBE_TARGET).get("status"),
+		McpClient.Status.CONFIGURED,
+	)
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(0, _PROBE_PROJECT, "project", _PROBE_TARGET).get("status"),
+		McpClient.Status.CONFIGURED,
+	)
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(0, _PROBE_LOCAL, "local", _PROBE_TARGET).get("status"),
+		McpClient.Status.CONFIGURED,
+	)
+
+
+func test_scope_probe_verdict_absent_entry_and_drift() -> void:
+	## `claude mcp get` exits 1 with "No MCP server named ..." when absent.
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(1, "No MCP server named \"godot-ai\".", "project", _PROBE_TARGET).get("status"),
+		McpClient.Status.NOT_CONFIGURED,
+	)
+	## Right scope, wrong launcher — still drift, same as the JSON path.
+	var drifted := McpCliStrategy._scope_probe_verdict(
+		0, _PROBE_PROJECT, "project", "/somewhere/else/uvx"
+	)
+	assert_eq(drifted.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	## #879 regression guard: a launcher drift sends the user to the wrong file
+	## just as readily as a scope drift does. The `Scope:` label is right there
+	## in the probe output, so the verdict must carry it — without it
+	## `_post_state_path_hint` falls back to `resolved_config_path()` and names
+	## ~/.claude.json for an entry that actually lives in .mcp.json.
+	assert_eq(drifted.get("resolved_scope"), "project",
+		"a target drift must still report the scope the entry resolved from")
+
+	## ...but only when the label actually parsed. A drift with no readable
+	## scope must not fabricate one; the hint degrades to the historical path.
+	var drift_no_label := McpCliStrategy._scope_probe_verdict(
+		0, "godot-ai:\n  Command: /somewhere/else/uvx\n", "project", _PROBE_TARGET
+	)
+	assert_eq(drift_no_label.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	assert_false(drift_no_label.has("resolved_scope"),
+		"an unparseable Scope line must not invent a scope for the path hint")
+	## A future CLI that stops printing a Scope line must degrade to the
+	## target check, not invent a red dot on a working install.
+	var no_label := "godot-ai:\n  Command: %s\n" % _PROBE_TARGET
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(0, no_label, "project", _PROBE_TARGET).get("status"),
+		McpClient.Status.CONFIGURED,
+		"an unparseable Scope line degrades to the target check",
+	)
+
+
+func test_json_fallback_configure_notes_the_scope_it_could_not_honour() -> void:
+	## #872 + #463: with no CLI on PATH, Configure falls back to writing the
+	## config file directly — and that file is the USER-scope one whatever the
+	## setting says. The write is real and works, so it stays `ok`; the caveat
+	## rides in the message rather than in the status, because
+	## _verify_post_state converts any non-CONFIGURED status after a successful
+	## write into an error (see test_verify_post_state_treats_drift_as_failure_
+	## after_configure) and a correct write must not report as a failure.
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		skip("EditorSettings unavailable in test environment")
+		return
+	var path := _scratch_dir.path_join("fallback_scope_note.json")
+	_remove_if_exists(path)
+	var client := _make_scope_cli_client(path)
+	var launch := {"ok": true, "command": "uvx", "args": ["godot-ai", "attach"]}
+
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "project")
+	var noted := McpClientConfigurator._dispatch_configure(client, "", launch)
+	assert_eq(noted.get("status"), "ok", "the fallback write really did land — it is not a failure")
+	var msg := str(noted.get("message", ""))
+	assert_contains(msg, "project", "the message must name the scope that was asked for")
+	assert_contains(msg, "user", "...and the scope it actually wrote")
+
+	## The status still reads CONFIGURED, so Configure does not end in the
+	## "configure ok but verification reads Not configured" false error.
+	var status := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", "", {}, launch
+	)
+	assert_eq(status.get("status"), McpClient.Status.CONFIGURED,
+		"a fallback-written entry must verify clean, or configure reports success as failure")
+
+	## At the default scope there is nothing to warn about — no note.
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, McpSettings.DEFAULT_CLIENT_SCOPE)
+	var plain := McpClientConfigurator._dispatch_configure(client, "", launch)
+	assert_eq(plain.get("status"), "ok")
+	assert_false(str(plain.get("message", "")).contains("wrote user scope"),
+		"no scope caveat when the selected scope is the one the fallback writes")
+	_restore_client_scope()
+	_remove_if_exists(path)
+
+
+func test_claude_code_declares_scope_aware_status_probe() -> void:
+	## `mcp list` cannot say which scope resolved, so a `{scope}` descriptor
+	## needs the richer probe. Same single subprocess — see #238/#239 for why
+	## adding a second CLI spawn per status check would not be acceptable.
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	var probe := client.cli_scope_status_template
+	assert_false(probe.is_empty(), "scope-token client must declare a scope probe")
+	assert_true(probe.has("get"), "the probe must be `mcp get`, which prints the Scope line")
+	assert_true(probe.has("{name}"), "probe must target our server by name")
+	var args := McpCliStrategy.format_args(probe, "godot-ai", "")
+	assert_true(args.has("godot-ai"), "{name} must substitute")
+	assert_false(args.has("{name}"), "no token may reach the CLI unsubstituted")
 
 
 func test_claude_code_manual_command_shows_json_fallback() -> void:
@@ -1653,6 +2105,27 @@ func test_claude_code_manual_command_shows_json_fallback() -> void:
 	assert_contains(cmd, "\"type\": \"stdio\"", "JSON fallback should show the stdio entry shape")
 	assert_contains(cmd, "Advanced fallback", "URL mode stays available as the documented fallback")
 	assert_contains(cmd, "\"type\": \"http\"", "URL fallback entry keeps the type:http shape")
+
+
+func test_claude_code_manual_command_renders_pre_cleanup_sweep() -> void:
+	## #877: Configure's first act is the all-scope `mcp remove` sweep, and its
+	## `--scope project` pass edits the .mcp.json in the CLI's cwd. The manual
+	## text has to show those removes, in the order Configure runs them —
+	## otherwise the snippet the user is told to run is not what the button runs
+	## and the sweep's side effect stays invisible.
+	var cmd := McpClientConfigurator.manual_command("claude_code")
+	for scope in McpSettings.CLIENT_SCOPES:
+		assert_contains(cmd, "mcp remove --scope %s godot-ai" % scope)
+	var remove_pos := cmd.find("mcp remove")
+	var add_pos := cmd.find("mcp add")
+	assert_true(add_pos >= 0 and remove_pos >= 0 and remove_pos < add_pos,
+		"the sweep must precede the register line, as Configure runs them")
+	## One shell label for the whole block, so it stays a single copy-paste.
+	assert_eq(cmd.count("Run in PowerShell:") + cmd.count("Run in a POSIX shell:"), 1,
+		"removes and register belong under one label, not one label each")
+	## The cwd hazard cannot be read off the commands themselves.
+	assert_contains(cmd, "launched from",
+		"the manual text must say the project remove targets the editor's cwd")
 
 
 func test_manual_cli_shell_renderers_preserve_literal_argv() -> void:
@@ -2253,6 +2726,72 @@ func test_verify_post_state_errors_when_configure_did_not_land() -> void:
 	assert_contains(msg, "not_configured", "Error must name the actual status: %s" % msg)
 	assert_contains(msg, "configured", "Error must name the expected status: %s" % msg)
 	assert_contains(msg, path, "Error must include the resolved config path: %s" % msg)
+
+
+func test_post_state_path_hint_follows_resolved_scope() -> void:
+	## #879: after a cross-scope mismatch the surviving entry is NOT in the file
+	## `path_template` resolves to. Telling the user to inspect ~/.claude.json
+	## for a project-scope survivor sends them somewhere with nothing to find.
+	## The probe supplies `resolved_scope`; this pins the hint chosen from it
+	## (the plumbing that produces it is pinned by
+	## test_scope_probe_dispatch_uses_its_own_template_and_the_selected_scope).
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	var project_hint := McpClientConfigurator._post_state_path_hint(client, "project")
+	assert_contains(project_hint, ".mcp.json")
+	assert_false(project_hint.contains(".claude.json"),
+		"a project-scope survivor must not point at the user-scope file: %s" % project_hint)
+	var local_hint := McpClientConfigurator._post_state_path_hint(client, "local")
+	assert_contains(local_hint, ".claude.json",
+		"local scope lives in a per-project block of the user-scope file")
+	## Which block, though: `local` is keyed by the CLI's working directory, the
+	## same cwd distinction the project branch spells out. "this project's
+	## block" sends a user who launched the editor from elsewhere to a key that
+	## does not exist while the entry sits under the launch directory.
+	assert_contains(local_hint, "launched from",
+		"the local hint must name the launch directory, not this project")
+
+	## Every other branch guards an unresolvable path; this one used to render
+	## " ... in  and remove ..." with a hole where the path belongs. Uses a
+	## scratch descriptor rather than clearing `path_template` on the registered
+	## claude_code, which the registry hands out by reference (#878).
+	var unresolvable := _make_scope_cli_client(_scratch_dir.path_join("hint_no_path.json"))
+	unresolvable.path_template = {}
+	assert_eq(McpClientConfigurator._post_state_path_hint(unresolvable, "local"), "",
+		"an unresolvable path yields no hint rather than a sentence with a hole")
+
+	var default_hint := McpClientConfigurator._post_state_path_hint(client, "")
+	assert_contains(default_hint, client.resolved_config_path(),
+		"no probe scope keeps the historical resolved-path hint")
+
+
+func test_configure_sweep_note_names_every_cleared_scope() -> void:
+	## #877: the manual-command panel listing the pre-cleanup removes is only
+	## shown when Configure FAILS, which left the success path — the one where
+	## the sweep actually deleted `godot-ai` from a .mcp.json that may belong to
+	## an unrelated repository — with no disclosure at all. The row note is that
+	## disclosure, so it must name the same scopes the sweep actually walks.
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	var note := McpClientConfigurator.configure_sweep_note("claude_code")
+	assert_contains(note, "godot-ai", "the note must name the key Configure deletes")
+	assert_contains(note, "attempted to clear",
+		"configure() discards every remove result, so the note must not claim the scopes were cleared")
+	for scope in McpCliStrategy.cleanup_scopes(client):
+		assert_contains(note, String(scope),
+			"the note must name every scope Configure clears, including %s" % scope)
+
+	## Only `{scope}` CLI descriptors sweep beyond the entry they rewrite. A
+	## single implicit pass removes exactly what the register puts back, so
+	## everything else stays silent — the same rule `_sweep_caveat` applies.
+	for id in McpClientConfigurator.client_ids():
+		var other := McpClientRegistry.get_by_id(id)
+		if other != null and other.config_type != "cli":
+			assert_eq(McpClientConfigurator.configure_sweep_note(id), "",
+				"%s is not a CLI client and must not claim a scope sweep" % id)
+
+	assert_eq(McpClientConfigurator.configure_sweep_note("no_such_client_xyz"), "",
+		"an unknown id yields no note rather than an error string")
 
 
 func test_verify_post_state_errors_when_remove_left_entry_behind() -> void:
@@ -3701,11 +4240,25 @@ func _restore_port_settings() -> void:
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
 		return
-	if _saved_http_port == null:
-		es.set_setting(McpSettings.SETTING_HTTP_PORT, McpClientConfigurator.DEFAULT_HTTP_PORT)
-	else:
+	if _had_http_port_setting:
 		es.set_setting(McpSettings.SETTING_HTTP_PORT, _saved_http_port)
-	if _saved_ws_port == null:
-		es.set_setting(McpClientConfigurator.SETTING_WS_PORT, McpClientConfigurator.DEFAULT_WS_PORT)
-	else:
+	elif es.has_setting(McpSettings.SETTING_HTTP_PORT):
+		es.erase(McpSettings.SETTING_HTTP_PORT)
+	if _had_ws_port_setting:
 		es.set_setting(McpClientConfigurator.SETTING_WS_PORT, _saved_ws_port)
+	elif es.has_setting(McpClientConfigurator.SETTING_WS_PORT):
+		es.erase(McpClientConfigurator.SETTING_WS_PORT)
+	_restore_client_scope()
+
+
+## Per-test restore. The scope setting now steers status routing as well as
+## argv (#872), so leaking `project` out of one test silently changes which
+## code path every later test in the suite exercises.
+func _restore_client_scope() -> void:
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		return
+	if _had_client_scope_setting:
+		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, _saved_client_scope)
+	elif es.has_setting(McpSettings.SETTING_CLIENT_SCOPE):
+		es.erase(McpSettings.SETTING_CLIENT_SCOPE)

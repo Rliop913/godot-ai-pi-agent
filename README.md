@@ -110,6 +110,57 @@ configuration supports URL transport also show an advanced URL fallback.
 (Cherry Studio intentionally stays URL-mode — its MCP servers are managed
 inside the app, not via an external config file.)
 
+<details>
+<summary><strong>Registering per-project instead of globally</strong></summary>
+
+CLI-configured clients register at **user** scope by default, which is a single
+global config the client loads in every workspace — so the Godot AI tools are
+present even in projects that have nothing to do with Godot.
+
+Set **Editor Settings → Plugins → `godot_ai/mcp_client_scope`** to `project` and
+Configure writes the entry into the project's own config (for Claude Code,
+`<project>/.mcp.json`) instead. The server is then loaded only when the client is
+opened on that project. `local` is also accepted for clients that support it.
+
+The default stays `user` so existing installs are unchanged on upgrade. To move
+an existing entry, change the setting and press **Configure** again — Configure
+clears `godot-ai` out of every scope before writing the new one, so the old
+entry doesn't linger. **Remove**, by contrast, only targets the scope that is
+currently selected, so switch back before removing if you changed the setting.
+
+> [!IMPORTANT]
+> That clearing step runs at **every** setting, including the default `user`.
+> One of its passes is `claude mcp remove --scope project godot-ai`, which
+> rewrites the `.mcp.json` in the client CLI's working directory — see the
+> first caveat below for why that is not necessarily this project's folder. If
+> a repository keeps a hand-maintained `godot-ai` entry in a checked-in
+> `.mcp.json`, pressing **Configure** deletes that entry and leaves the file
+> dirty. Only a key named `godot-ai` is touched; other servers are left in
+> place. After a successful **Configure** the client's row names the scopes it
+> attempted to clear (the remove results are not checked, so a scope can be
+> listed without its removal having succeeded); if Configure fails, the dock's
+> "Run this manually" text lists these removes alongside the register line so
+> you can run them yourself.
+
+Two caveats for `project` scope:
+
+- The client CLI resolves the project config against **its own working
+  directory**, which is the one the Godot editor was launched from — not
+  necessarily the project folder. Launching Godot from the project directory
+  (or from a shell already `cd`'d into it) puts `.mcp.json` where you expect.
+- Claude Code will not actually load a `project`-scoped server until you
+  approve it: run `claude` in that project once and accept the prompt. Until
+  then `claude mcp get godot-ai` reports *Pending approval*, and an older
+  `user`-scoped entry can keep answering in its place.
+- Status for a project- or local-scoped entry is read back by asking the client
+  CLI about the server rather than by reading the config file directly. The
+  dock reports configured / not configured correctly and will flag an entry
+  that resolved from a different scope than the one you selected, but it can no
+  longer spot a stale entry whose *arguments* drifted — press **Configure**
+  again after changing the port or excluded domains.
+
+</details>
+
 ### 4. Try it
 
 - *"Show me the current scene hierarchy."*

@@ -220,6 +220,15 @@ Calls take the form:
 | `tileset_manage` | `tileset_get_atlas_tiles`, `tileset_get_atlas_image` |
 | `gridmap_manage` | `gridmap_set_item`, `gridmap_fill`, `gridmap_clear`, `gridmap_get_used_cells`, `gridmap_list_library_items` |
 | `csg_manage` | `csg_create`, `csg_set_operation` |
+| `custom_manage` | `list`, `invoke` |
+
+Third-party addons register custom tools in-editor (see
+`docs/plugin-architecture.md` → "Custom Tools"). All enabled custom tools are
+reachable via `custom_manage`; specs with `promoted = true` additionally
+register as first-class MCP tools named `custom_<name>` with the addon's own
+schema (capped; overflow stays behind `custom_manage`). The dock's Tools tab
+lists registered custom tools with per-tool enable/disable that applies
+immediately.
 
 `filesystem_manage.reimport` is intended for imported assets such as textures,
 models, and audio. Godot scripts (`.gd`) are not imported resources: a successful

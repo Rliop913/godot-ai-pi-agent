@@ -479,6 +479,25 @@ func test_apply_row_status_renders_mismatch_as_amber_with_url_hint() -> void:
 		"Mismatched rows offer the same Reconfigure action as the banner")
 
 
+func test_apply_row_status_mismatch_prefers_probe_message() -> void:
+	## A `{scope}` client can drift by being registered in a scope the user
+	## did not select (#872). "URL out of date" is a wrong description of
+	## that, so a probe-supplied message wins the label.
+	_dock._build_ui()
+	var any_id := McpClientConfigurator.client_ids()[0]
+	_dock._apply_row_status(
+		any_id, McpClient.Status.CONFIGURED_MISMATCH, "registered at user scope, not project"
+	)
+	var row: Dictionary = _dock._client_rows[any_id]
+	assert_eq((row["dot"] as ColorRect).color, McpDockScript.COLOR_AMBER,
+		"a scope mismatch is still drift, so it stays amber")
+	var label := (row["name_label"] as Label).text
+	assert_contains(label, "registered at user scope, not project",
+		"the probe's own words must reach the row")
+	assert_false(label.contains("URL out of date"),
+		"a scope mismatch is not a stale URL — that label would misdescribe it")
+
+
 func test_client_rows_show_config_file_buttons_only_for_file_clients() -> void:
 	_dock._build_ui()
 	var file_id := "cursor"
@@ -572,6 +591,41 @@ func test_drift_banner_clears_after_per_row_reconfigure() -> void:
 		"Banner must clear once the last amber row is reconfigured")
 	assert_eq(_dock._last_mismatched_ids, [] as Array[String],
 		"Cache must drop the now-green client so a follow-up Reconfigure-mismatched click is a no-op")
+
+
+func test_successful_configure_discloses_the_scope_sweep_on_the_row() -> void:
+	## #877: `_show_manual_command_for` — the only thing that reveals the panel
+	## listing the pre-cleanup removes — is called just once, on the Configure
+	## FAILURE branch. So a successful Configure cleared `godot-ai` out of every
+	## scope, including a .mcp.json in whatever directory the editor happened to
+	## be launched from, and told the user nothing. The green row carries that.
+	_dock._build_ui()
+	assert_true(_dock._client_rows.has("claude_code"),
+		"claude_code is a static registry entry and must have a row")
+	if not _dock._client_rows.has("claude_code"):
+		return
+	var row: Dictionary = _dock._client_rows["claude_code"]
+	var note := McpClientConfigurator.configure_sweep_note("claude_code")
+	assert_false(note.is_empty(), "claude_code is the scope-sweeping descriptor")
+
+	_dock._apply_row_status("claude_code", McpClient.Status.CONFIGURED, note)
+	var label := (row["name_label"] as Label).text
+	assert_contains(label, note,
+		"a successful configure must disclose the sweep it just performed")
+	assert_contains(label, "project",
+		"the destructive pass is the project one — the row has to name it")
+	assert_eq((row["dot"] as ColorRect).color, Color.GREEN,
+		"the note is a disclosure on a healthy row, not a warning state")
+
+	## Transient by design: the next status refresh re-applies CONFIGURED with
+	## no detail, so the row settles back to its plain name rather than pinning
+	## a note that no longer describes anything that just happened.
+	_dock._apply_row_status("claude_code", McpClient.Status.CONFIGURED)
+	assert_eq(
+		(row["name_label"] as Label).text,
+		McpClientConfigurator.client_display_name("claude_code"),
+		"the note must not survive an ordinary status refresh",
+	)
 
 
 func test_focus_in_auto_refresh_is_enabled_with_async_cooldown() -> void:

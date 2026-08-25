@@ -111,6 +111,7 @@ static func ensure_settings_registered() -> void:
 	_register_port_setting(es, SETTING_WS_PORT, DEFAULT_WS_PORT)
 	_register_bool_setting(es, SETTING_STARTUP_TRACE, false)
 	_register_bool_setting(es, SETTING_KEEP_SERVER_ON_EXIT, false)
+	_register_client_scope_setting(es)
 
 
 static func _register_port_setting(es: EditorSettings, key: String, default_port: int) -> void:
@@ -122,6 +123,22 @@ static func _register_port_setting(es: EditorSettings, key: String, default_port
 		"type": TYPE_INT,
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "%d,%d,1" % [MIN_PORT, MAX_PORT],
+	})
+
+
+## Surface the CLI registration scope as an enum in Settings > Plugins so it is
+## discoverable without hand-editing editor_settings-4.tres. Kept at `user` by
+## default; `project` writes the entry into <project>/.mcp.json instead.
+static func _register_client_scope_setting(es: EditorSettings) -> void:
+	var key := McpSettings.SETTING_CLIENT_SCOPE
+	if not es.has_setting(key):
+		es.set_setting(key, McpSettings.DEFAULT_CLIENT_SCOPE)
+	es.set_initial_value(key, McpSettings.DEFAULT_CLIENT_SCOPE, false)
+	es.add_property_info({
+		"name": key,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_ENUM,
+		"hint_string": ",".join(PackedStringArray(McpSettings.CLIENT_SCOPES)),
 	})
 
 
@@ -461,6 +478,7 @@ static func warm_env_snapshot() -> void:
 	_editor_setting_lookup(MODE_OVERRIDE_SETTING)
 	_editor_setting_lookup(SETTING_STARTUP_TRACE)
 	_editor_setting_lookup(SETTING_KEEP_SERVER_ON_EXIT)
+	McpSettings.warm_client_scope()
 	# Publish the complete launch context while EditorInterface access is safe;
 	# worker callers of capture_launch_context() read this snapshot only.
 	capture_launch_context()
@@ -605,7 +623,9 @@ static func _dispatch_configure(
 			# #463: fall back to writing the config file directly when the CLI
 			# binary isn't on PATH (Claude Code as a VS Code/Cursor extension).
 			if client.has_json_fallback() and CliStrategy.resolve_cli_path(client).is_empty():
-				return JsonStrategy.configure(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
+				return _note_unhonoured_scope(
+					client, JsonStrategy.configure(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
+				)
 			return CliStrategy.configure(client, SERVER_NAME, url, launch)
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
@@ -669,7 +689,13 @@ static func _dispatch_check_status_with_cli_path_details(
 			# file gives exact launch-drift detection — a changed port, version
 			# pin, or exclusion list — which scanning `mcp list` stdout cannot,
 			# so it is preferred even when the CLI binary resolves.
-			if client.command_shape != Client.CommandShape.NONE and client.has_json_fallback():
+			# #872: ...but only while the selected scope is still the one
+			# `path_template` points at — see _scope_diverges_from_json_fallback.
+			if (
+				client.command_shape != Client.CommandShape.NONE
+				and client.has_json_fallback()
+				and not _scope_diverges_from_json_fallback(client)
+			):
 				var command_launch := _resolved_or_discovered_launch(client, resolved_launch, launch_context)
 				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch, _project_roots_from_context(launch_context))
 			var resolved_cli := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
@@ -683,8 +709,87 @@ static func _dispatch_check_status_with_cli_path_details(
 			var cli_launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
 				cli_launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
+			# #872: at a scope `path_template` can't see, a plain listing probe
+			# cannot tell our entry from a leftover one in another scope. When
+			# the descriptor offers a scope-aware probe, use it — same single
+			# subprocess, but it reports which scope actually resolved.
+			if (
+				not client.cli_scope_status_template.is_empty()
+				and CliStrategy.uses_scope_token(client)
+			):
+				return CliStrategy.check_scope_status_details(
+					client, SERVER_NAME, url, resolved_cli, cli_launch, McpSettings.client_scope()
+				)
 			return CliStrategy.check_status_details(client, SERVER_NAME, url, resolved_cli, cli_launch)
 	return {"status": Client.Status.NOT_CONFIGURED, "error_msg": ""}
+
+
+## #872: the #463 JSON fallback writes the user-scope file whatever
+## `godot_ai/mcp_client_scope` says — that file IS `path_template`, and
+## `clients/_path_template.gd` has no project-relative token to aim it
+## elsewhere. Returning a bare "configured" would hide that the requested
+## scope was not honoured, so say so in the message.
+##
+## Deliberately a message and not a status. `_verify_post_state` compares the
+## post-write status against CONFIGURED and replaces the ok with an error on
+## any mismatch (pinned by test_verify_post_state_treats_drift_as_failure_
+## after_configure), so reporting this write as NOT_CONFIGURED or MISMATCH
+## would turn a *successful* configure into a user-facing failure — the same
+## false-error class #872's blocker was about, just moved onto the fallback
+## path. The entry is genuinely written and genuinely works; only its scope
+## differs from the request, and that is a caveat, not a failure.
+static func _note_unhonoured_scope(client: Client, result: Dictionary) -> Dictionary:
+	if result.get("status") != "ok":
+		return result
+	if not CliStrategy.uses_scope_token(client):
+		return result
+	var scope := McpSettings.client_scope()
+	if scope == McpSettings.DEFAULT_CLIENT_SCOPE:
+		return result
+	var noted := result.duplicate(true)
+	noted["message"] = (
+		"%s — wrote %s scope, not %s: the %s CLI wasn't found, and the file fallback can only write %s"
+		% [
+			str(result.get("message", "")),
+			McpSettings.DEFAULT_CLIENT_SCOPE,
+			scope,
+			client.display_name,
+			client.resolved_config_path(),
+		]
+	)
+	return noted
+
+
+## True when this client's CLI writes its entry somewhere `path_template`
+## cannot see, so reading that file would describe the wrong thing (#872).
+##
+## `claude mcp add --scope project` writes <cwd>/.mcp.json and `--scope local`
+## writes a per-project block inside ~/.claude.json — neither is the top-level
+## `mcpServers` map `path_template` + `server_key_path` resolve to. Reading it
+## anyway makes `_verify_post_state` turn every successful project-scope
+## Configure into "configure ok but verification still reads Not configured",
+## and pins the dock row red (or green, describing a stale user-scope entry).
+##
+## Diverging sends status down the CLI probe instead: `mcp list` is
+## scope-agnostic and inherits the same cwd the register ran in, so read-back
+## and write agree by construction. The cost is losing exact launch-drift
+## detection — a stdout scan sees the command, not the full argv — which is the
+## documented trade for a status that is merely coarse instead of wrong.
+##
+## Deliberately says nothing about whether the CLI resolves (#879). An earlier
+## version walked PATH here and returned false for an unresolvable binary, on
+## the reasoning that configure would then have taken the #463 JSON fallback —
+## which writes user scope whatever the setting says — so the file was the
+## right thing to read again. That extra clause could not change any outcome:
+## this is only consulted from the one call site below, already guarded on
+## `has_json_fallback()`, and when the CLI does not resolve the very next
+## branch (`resolved_cli.is_empty() and client.has_json_fallback()`) takes the
+## fallback read anyway. All it bought was a second full `McpCliFinder.find`
+## sweep per status check, on top of the one that immediately follows.
+static func _scope_diverges_from_json_fallback(client: Client) -> bool:
+	if not CliStrategy.uses_scope_token(client):
+		return false
+	return McpSettings.client_scope() != McpSettings.DEFAULT_CLIENT_SCOPE
 
 
 static func _resolved_or_discovered_launch(
@@ -713,13 +818,13 @@ static func _verify_post_state(
 ) -> Dictionary:
 	if result.get("status") != "ok":
 		return result
-	var actual := _dispatch_check_status_with_cli_path_details(
+	var details := _dispatch_check_status_with_cli_path_details(
 		client, url, "", launch_context, resolved_launch
-	).get("status", Client.Status.NOT_CONFIGURED)
+	)
+	var actual := details.get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
 		return result
-	var path := client.resolved_config_path()
-	var path_hint := "" if path.is_empty() else " Inspect %s and remove the godot-ai entry by hand if needed." % path
+	var path_hint := _post_state_path_hint(client, str(details.get("resolved_scope", "")))
 	return {
 		"status": "error",
 		"message": "%s reported %s ok but verification still reads %s (expected %s).%s" % [
@@ -728,6 +833,63 @@ static func _verify_post_state(
 			path_hint,
 		],
 	}
+
+
+## Where to send the user when verification finds an entry that should not be
+## there. `resolved_config_path()` is `path_template` — right only for the
+## default user scope. Naming ~/.claude.json for a project-scope survivor sends
+## them to a file with nothing in it, which is worse than naming no file at all
+## (#879). The scope probe supplies `resolved_scope`; `path_template` has no
+## project-relative token (see `_note_unhonoured_scope`), so the project case is
+## described rather than resolved to a path.
+static func _post_state_path_hint(client: Client, resolved_scope: String) -> String:
+	match resolved_scope:
+		"project":
+			return (
+				" The surviving entry is project-scoped: inspect the .mcp.json in the"
+				+ " directory the editor was launched from and remove the godot-ai entry"
+				+ " by hand if needed."
+			)
+		"local":
+			var local_path := client.resolved_config_path()
+			if local_path.is_empty():
+				return ""
+			return (
+				" The surviving entry is local-scoped: inspect the block for the"
+				+ " directory the editor was launched from in %s and remove the"
+				+ " godot-ai entry by hand if needed."
+			) % local_path
+		_:
+			var path := client.resolved_config_path()
+			if path.is_empty():
+				return ""
+			return " Inspect %s and remove the godot-ai entry by hand if needed." % path
+
+
+## #877: Configure's first act is the all-scope pre-cleanup — it deletes the
+## `godot-ai` entry from every scope the descriptor can write to, including a
+## `.mcp.json` resolved against the CLI's working directory, which need not be
+## this project's folder. The manual-command panel that spells those removes
+## out is only shown when Configure FAILS (`mcp_dock.gd`), so on the success
+## path — the one where the sweep actually ran — this note is its only
+## disclosure. Empty for descriptors without a scope token: their single
+## implicit pass removes exactly the entry the register is about to rewrite,
+## which needs no warning (the same rule `_sweep_caveat` applies).
+##
+## "attempted", not "cleared": `CliStrategy.configure` discards every
+## pre-cleanup result, and `mcp remove` exits non-zero for an absent entry as
+## well as for a real failure, so a timed-out or failed remove leaves the scope
+## untouched while the register still returns ok. The note names what ran,
+## not what it can prove.
+static func configure_sweep_note(id: String) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null or client.config_type != "cli":
+		return ""
+	if client.cli_unregister_template.is_empty() or not CliStrategy.uses_scope_token(client):
+		return ""
+	return "attempted to clear %s from %s" % [
+		SERVER_NAME, ", ".join(CliStrategy.cleanup_scopes(client)),
+	]
 
 
 static func manual_command(id: String) -> String:
