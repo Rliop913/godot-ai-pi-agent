@@ -4904,6 +4904,44 @@ func test_text_remove_server_entry_sibling_collision_deletes_only_target() -> vo
 	assert_true((parsed as Dictionary)["extensions"].has(McpClientConfigurator.SERVER_NAME), "extensions." + McpClientConfigurator.SERVER_NAME + " must SURVIVE (sibling collision guard); got: %s" % updated)
 
 
+func test_text_remove_server_entry_whitespace_before_trailing_comma() -> void:
+	## Codex round 4: when the target entry is FIRST in its container AND
+	## there's whitespace between its value and the trailing comma (e.g.
+	## `"godot-ai":{}   ,"other":{}`), the trailing-comma detector must
+	## skip the whitespace. Without the fix, `had_trailing_comma` stays
+	## false, no leading comma is consumed (because there isn't one for a
+	## first-position entry), and the result has a dangling comma at the
+	## start of the container — invalid JSON.
+	var helper := McpJsonStrategy
+	var body := '{"mcpServers":{"' + McpClientConfigurator.SERVER_NAME + '":{}   ,"other":{}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	var parsed: Variant = JSON.parse_string(updated)
+	assert_true(parsed is Dictionary, "result must be valid JSON; got: %s" % updated)
+	var mcp: Dictionary = (parsed as Dictionary)["mcpServers"]
+	assert_false(mcp.has(McpClientConfigurator.SERVER_NAME), "target entry must be removed; got: %s" % updated)
+	assert_true(mcp.has("other"), "sibling must survive; got: %s" % updated)
+	assert_false(updated.contains("  ,"), "leading whitespace+comma artifact must not survive; got: %s" % updated)
+	assert_false(updated.contains(",\"other\":") and updated.find(",\"other\":") > updated.find("\"mcpServers\":"), "no leading comma before other; got: %s" % updated)
+
+
+func test_text_remove_server_entry_whitespace_before_trailing_comma_middle_position() -> void:
+	## Codex round 4 (combined with F5 round 2 bug a): middle-position entry
+	## with whitespace before its trailing comma must also still consume
+	## that comma. Catches a future refactor that mishandles the
+	## whitespace-skip path.
+	var helper := McpJsonStrategy
+	var body := '{"mcpServers":{"a":1,"' + McpClientConfigurator.SERVER_NAME + '":2   ,"b":3}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	var parsed: Variant = JSON.parse_string(updated)
+	assert_true(parsed is Dictionary, "result must be valid JSON; got: %s" % updated)
+	var mcp: Dictionary = (parsed as Dictionary)["mcpServers"]
+	assert_true(mcp.has("a"), "'a' must survive; got: %s" % updated)
+	assert_true(mcp.has("b"), "'b' must survive; got: %s" % updated)
+	assert_false(mcp.has(McpClientConfigurator.SERVER_NAME), "target must be gone; got: %s" % updated)
+	# Belt-and-braces: a single comma between a and b.
+	assert_eq(updated.count(","), 1, "exactly one comma must remain between 'a' and 'b'; got: %s" % updated)
+
+
 # ----- F-3-6: UTF-8 BOM skip -----
 # Windows editors (Notepad, some VSCode configs) save JSON with a leading
 # UTF-8 BOM (U+FEFF, bytes 0xEF 0xBB 0xBF). `_read_file_text` strips the BOM

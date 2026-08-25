@@ -836,9 +836,16 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 	# middle-position entry into `"x"}"y"` with no separator — codex-review
 	# finding F5 (regression after the initial round).
 	var remove_end := value_end
-	var had_trailing_comma := remove_end < text.length() and text[remove_end] == ","
+	# Skip JSON whitespace before checking for the trailing comma — valid
+	# (if unusual) formats like `"godot-ai":{}   ,"other":{}` put whitespace
+	# between the value and its separator. codex round 4 finding.
+	var trailing_scan := remove_end
+	while trailing_scan < text.length() and _is_json_ws(text[trailing_scan]):
+		trailing_scan += 1
+	var had_trailing_comma := trailing_scan < text.length() and text[trailing_scan] == ","
 	if had_trailing_comma:
-		remove_end += 1
+		# Jump past the comma (and any whitespace before it we just skipped).
+		remove_end = trailing_scan + 1
 	while remove_end < text.length() and _is_json_ws(text[remove_end]):
 		remove_end += 1
 	var remove_start := key_start
