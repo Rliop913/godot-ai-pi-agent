@@ -41,6 +41,10 @@ static func configure(
 	var existing: Variant = holder.get(server_name, null)
 	holder[server_name] = build_entry(client, server_url, existing, launch)
 
+	# F5: refuse to re-serialize a file whose parsed integers above 2^53 would
+	# lose precision. Editing by hand keeps those values intact.
+	if _has_lossy_numbers(config):
+		return {"status": "error", "message": "Refusing to rewrite %s: contains integers above 2^53 that Godot's JSON parser would re-emit imprecise. Edit the file by hand." % path}
 	if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
 		return {"status": "error", "message": "Cannot write to %s" % path}
 	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
@@ -82,9 +86,25 @@ static func _configure_merged(
 	var existing: Variant = holder.get(server_name, null)
 	holder[server_name] = build_entry(client, server_url, existing, launch)
 	var path := str(tier["path"])
+	# F5: refuse to re-serialize a tier whose parsed integers above 2^53 would
+	# lose precision. The same check guards the simple `configure` path.
+	if _has_lossy_numbers(config):
+		return {"status": "error", "message": "Refusing to rewrite %s: contains integers above 2^53 that Godot's JSON parser would re-emit imprecise. Edit the file by hand." % path}
 	if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
 		return {"status": "error", "message": "Cannot write to %s" % path}
-	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
+	# Codex F1 caveat: when we wrote a global tier but couldn't find any project
+	# override in the roots we probed AND the user hasn't told us where Pi (or any
+	# external cwd client) actually runs from, we can't prove this write is the
+	# effective config. Surface the actionable hint instead of silently passing.
+	# The early `not project_tiers.is_empty()` return above already covers the
+	# "project override exists in probed roots" case (we fail closed there), so
+	# reaching this point with `project_tiers.is_empty()` means: no probed
+	# override was found.
+	var message := McpClient.configured_message(client, server_url)
+	var external_cwd := str(McpClientConfigurator._editor_setting_lookup(McpClientConfigurator.SETTING_EXTERNAL_CLIENT_CWD))
+	if external_cwd.is_empty() and project_tiers.is_empty():
+		message += " If %s is launched from a cwd this editor cannot see, the effective entry may still be in a project-tier file — set godot_ai/external_client_cwd to that cwd to verify." % client.display_name
+	return {"status": "ok", "message": message}
 
 
 static func check_status(
@@ -150,10 +170,16 @@ static func _check_status_merged(
 		return {"status": McpClient.Status.ERROR, "error_msg": str(project.get("error", "Cannot inspect project config tiers"))}
 	var project_tiers: Array = project.get("tiers", [])
 	if not project_tiers.is_empty():
-		for project_tier in project_tiers:
-			var details := _entry_status_details(client, project_tier["entry"], server_url, launch)
-			if details.get("status") != McpClient.Status.CONFIGURED:
-				return {"status": McpClient.Status.CONFIGURED_MISMATCH, "error_msg": _project_override_message(project_tiers, "update or remove", client.display_name, server_name)}
+		# Last-definition-wins mirrors the global-tier fold above and how
+		# pi-codemode-mcp merges project tiers on disk. Earlier tiers are dead
+		# once a later one defines the same server, so an early-stale entry
+		# doesn't make Pi's effective config drift (codex-review finding F2).
+		# Pass `[latest]` to `_project_override_message` so the error names only
+		# the file the user actually has to edit.
+		var latest: Dictionary = project_tiers[project_tiers.size() - 1]
+		var details := _entry_status_details(client, latest["entry"], server_url, launch)
+		if details.get("status") != McpClient.Status.CONFIGURED:
+			return {"status": McpClient.Status.CONFIGURED_MISMATCH, "error_msg": _project_override_message([latest], "update or remove", client.display_name, server_name)}
 		return {"status": McpClient.Status.CONFIGURED, "error_msg": ""}
 	if effective == null:
 		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
@@ -190,15 +216,21 @@ static func remove(
 		return {"status": "error", "message": path_error}
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return {"status": "ok", "message": "Not configured"}
-	var read := _read_or_init(path)
-	if not read["ok"]:
-		return {"status": "error", "message": "Refusing to rewrite %s: %s." % [path, read["error"]]}
-	var config: Dictionary = read["data"]
-	var holder := _walk_path(config, select_server_key_path(config, client))
-	if holder is Dictionary and holder.has(server_name):
-		holder.erase(server_name)
-		if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
-			return {"status": "error", "message": "Cannot write to %s" % path}
+	# Token-preserving removal (F5): pull the original file text via
+	# `_read_file_text` and edit only the entry's bytes — keeps every other
+	# byte, including integers above 2^53, byte-for-byte identical to what
+	# the user wrote. The parsed-dict round-trip path is gone.
+	var file_read := _read_file_text(path)
+	if not file_read.get("ok", false):
+		return {"status": "error", "message": "Refusing to rewrite %s: %s." % [path, file_read.get("error", "")]}
+	var config: Dictionary = file_read.get("data", {})
+	var key_path := select_server_key_path(config, client)
+	var original_text: String = str(file_read.get("original_text", ""))
+	var updated: String = _text_remove_server_entry(original_text, key_path, server_name)
+	if updated == original_text:
+		return {"status": "ok", "message": "Not configured"}
+	if not McpAtomicWrite.write(path, updated):
+		return {"status": "error", "message": "Cannot write to %s" % path}
 	return {"status": "ok", "message": "%s configuration removed" % client.display_name}
 
 
@@ -218,15 +250,21 @@ static func _remove_merged(
 	for tier in loaded.get("tiers", []):
 		if not tier.get("exists", false):
 			continue
-		var config: Dictionary = tier["data"]
-		var holder := _walk_path(config, select_server_key_path(config, client))
-		if holder is Dictionary and holder.has(server_name):
-			holder.erase(server_name)
-			writes.append({
-				"path": tier["path"],
-				"text": JSON.stringify(_narrow_integral_numbers(config), "\t", false),
-				"original_text": tier["original_text"],
-			})
+		var key_path := select_server_key_path(tier["data"], client)
+		var original: String = str(tier.get("original_text", ""))
+		# Token-preserving removal (F5): edit `original` textually instead of
+		# re-serialising the parsed config. This preserves every byte outside
+		# the entry block, so unrelated integers (including those above the
+		# IEEE-754 exact-int range that `_narrow_integral_numbers` cannot
+		# round-trip) keep their original literals.
+		var updated: String = _text_remove_server_entry(original, key_path, server_name)
+		if updated == original:
+			continue  # entry not in this tier; skip
+		writes.append({
+			"path": tier["path"],
+			"text": updated,
+			"original_text": original,
+		})
 	if writes.is_empty():
 		return {"status": "ok", "message": "Not configured"}
 	var written := _write_transaction(writes)
@@ -665,3 +703,197 @@ static func _narrow_integral_numbers(value: Variant) -> Variant:
 			for i in value.size():
 				value[i] = _narrow_integral_numbers(value[i])
 	return value
+
+
+## True when `value` contains any float outside the IEEE-754 exact-int range
+## (`abs(f) > 2^53`) that would lose precision when JSON.stringify re-emits it.
+## The configure path refuses such files instead of silently mutating unrelated
+## integers; the remove path never needs this check because it does
+## token-preserving surgery (F5).
+static func _has_lossy_numbers(value: Variant) -> bool:
+	match typeof(value):
+		TYPE_FLOAT:
+			# `>=` not `>`: `2^53 + 1` rounds down to `2^53.0` when Godot parses
+			# the integer to double, so even a "clean" `2^53.0` after parse may
+			# have lost a least-significant bit we cannot recover. Refusing at
+			# the boundary is conservative but correct — and 2^53+ magnitudes
+			# don't appear in real MCP client configs anyway.
+			if is_finite(value) and absf(value) >= 9007199254740992.0:
+				return true
+		TYPE_DICTIONARY:
+			for k in value:
+				if _has_lossy_numbers(value[k]):
+					return true
+		TYPE_ARRAY:
+			for i in value.size():
+				if _has_lossy_numbers(value[i]):
+					return true
+	return false
+
+
+## Token-preserving entry removal. Walks the JSON text with a brace-balanced
+## scanner to locate the entry at `key_path[0]/.../[server_name]` and returns
+## `text` with that entry's bytes deleted (along with the surrounding
+## whitespace + trailing comma). Everything else — including integers above
+## the IEEE-754 exact-int range that `_narrow_integral_numbers` would silently
+## mutate — is preserved byte-for-byte. Returns `text` unchanged when the
+## entry isn't found in `text` (callers treat this as a no-op write).
+static func _text_remove_server_entry(text: String, key_path: PackedStringArray, server_name: String) -> String:
+	# Descend through `key_path`. Each step finds `"<key>":` directly inside the
+	# current container and moves the cursor past the value's opening `{` or `[`.
+	# After the loop, `cursor` is positioned just past the opening bracket of the
+	# container that holds our entry, and `container_depth` tracks how deeply
+	# nested that container is from the root (0 = root object/array).
+	var cursor := 0
+	# Skip past the root's opening `{` or `[` (and any leading whitespace) so
+	# `_find_key_at_container_depth` starts scanning from inside the root
+	# container with `inner_depth == 0`. Without this step, the first character
+	# encountered is the root's `{`, which bumps `inner_depth` to 1 and makes
+	# the top-level key check fail.
+	while cursor < text.length() and _is_json_ws(text[cursor]):
+		cursor += 1
+	if cursor < text.length() and (text[cursor] == "{" or text[cursor] == "["):
+		cursor += 1
+	var container_depth := 0
+	for key in key_path:
+		var key_bytes := JSON.stringify(String(key))
+		var match := _find_key_at_container_depth(text, cursor, key_bytes, container_depth)
+		if match.is_empty():
+			return text
+		var open_char := text[match["value_start"]]
+		if open_char != "{" and open_char != "[":
+			return text  # leaf isn't an object/array — path can't reach our entry
+		container_depth += 1
+		cursor = match["value_start"] + 1
+	# Now find `"<server_name>":` at `container_depth` inside the container.
+	var entry_bytes := JSON.stringify(server_name)
+	var entry_match := _find_key_at_container_depth(text, cursor, entry_bytes, container_depth)
+	if entry_match.is_empty():
+		return text
+	var key_start: int = entry_match["key_start"]
+	var value_end: int = entry_match["value_end"]
+	# Trim leading whitespace + an optional preceding comma from the removed
+	# span. The trailing-comma trim is the part that's load-bearing when our
+	# entry is NOT the last in the container; the leading-comma trim is the
+	# load-bearing counterpart when our entry IS the last (so we don't leave a
+	# trailing `,` followed by the container's closing `}`).
+	var remove_start := key_start
+	while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
+		remove_start -= 1
+	if remove_start > 0 and text[remove_start - 1] == ",":
+		remove_start -= 1
+		while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
+			remove_start -= 1
+	var remove_end := value_end
+	if remove_end < text.length() and text[remove_end] == ",":
+		remove_end += 1
+	while remove_end < text.length() and _is_json_ws(text[remove_end]):
+		remove_end += 1
+	return text.substr(0, remove_start) + text.substr(remove_end)
+
+
+## Look for `key_bytes` (a JSON-encoded string literal including the surrounding
+## quotes) at exactly `container_depth` inside `text`, starting the scan at
+## `start`. `container_depth` is the depth of the *container* we're inside —
+## 0 means "directly inside the root object/array", 1 means "inside the first
+## nested object/array", etc. Returns `{key_start, value_start, value_end}` on
+## success or `{}` if the key isn't present at that depth.
+static func _find_key_at_container_depth(text: String, start: int, key_bytes: String, container_depth: int) -> Dictionary:
+	var i := start
+	var in_string := false
+	var escape := false
+	var inner_depth := 0  # depth *inside* the current container
+	while i < text.length():
+		var c := text[i]
+		if in_string:
+			if escape:
+				escape = false
+			elif c == "\\":
+				escape = true
+			elif c == '"':
+				in_string = false
+			i += 1
+			continue
+		if c == '"':
+			if text.substr(i, key_bytes.length()) == key_bytes:
+				var after_key := i + key_bytes.length()
+				while after_key < text.length() and _is_json_ws(text[after_key]):
+					after_key += 1
+				if after_key < text.length() and text[after_key] == ":":
+					var value_start := after_key + 1
+					while value_start < text.length() and _is_json_ws(text[value_start]):
+						value_start += 1
+					var value_end := _json_value_span_end(text, value_start)
+					if value_end >= 0 and inner_depth == 0:
+						return {"key_start": i, "value_start": value_start, "value_end": value_end}
+			in_string = true
+			i += 1
+			continue
+		if c == "{" or c == "[":
+			inner_depth += 1
+		elif c == "}" or c == "]":
+			inner_depth -= 1
+		i += 1
+	return {}
+
+
+## Given `value_start` pointing at the first char of a JSON value, return the
+## position AFTER the value's last char. Handles objects, arrays, strings,
+## and bare literals (numbers, true/false/null). Returns -1 if the value is
+## unterminated.
+static func _json_value_span_end(text: String, value_start: int) -> int:
+	if value_start >= text.length():
+		return -1
+	var c := text[value_start]
+	if c == "{" or c == "[":
+		var open_char := c
+		var close_char := "}" if c == "{" else "]"
+		var depth := 1
+		var i := value_start + 1
+		var in_string := false
+		var escape := false
+		while i < text.length() and depth > 0:
+			var ch := text[i]
+			if in_string:
+				if escape:
+					escape = false
+				elif ch == "\\":
+					escape = true
+				elif ch == '"':
+					in_string = false
+				i += 1
+				continue
+			if ch == '"':
+				in_string = true
+			elif ch == open_char:
+				depth += 1
+			elif ch == close_char:
+				depth -= 1
+			i += 1
+		return i if depth == 0 else -1
+	if c == '"':
+		var i := value_start + 1
+		var escape := false
+		while i < text.length():
+			var ch := text[i]
+			if escape:
+				escape = false
+			elif ch == "\\":
+				escape = true
+			elif ch == '"':
+				return i + 1
+			i += 1
+		return -1
+	# Bare literal: number / true / false / null. Walk until a JSON-significant
+	# delimiter (`,`, `}`, `]`, or whitespace).
+	var i := value_start
+	while i < text.length():
+		var ch := text[i]
+		if ch == "," or ch == "}" or ch == "]" or _is_json_ws(ch):
+			break
+		i += 1
+	return i
+
+
+static func _is_json_ws(c: String) -> bool:
+	return c == " " or c == "\t" or c == "\n" or c == "\r"

@@ -902,7 +902,7 @@ func _build_client_row(client_id: String) -> void:
 	remove_btn.pressed.connect(_on_remove_client.bind(client_id))
 	row.add_child(remove_btn)
 
-	var config_path := ClientConfigurator.config_path(client_id)
+	var config_path := ClientConfigurator.effective_config_path(client_id)
 	var open_config_btn := Button.new()
 	_apply_editor_icon(open_config_btn, "ExternalLink", "Open")
 	open_config_btn.custom_minimum_size = Vector2(28, 28)
@@ -3409,7 +3409,10 @@ func _refresh_client_config_file_buttons(client_id: String) -> void:
 	var row: Dictionary = _client_rows.get(client_id, {})
 	if row.is_empty():
 		return
-	var config_path := String(row.get("config_path", ""))
+	# Re-resolve on every refresh so the Open/Reveal buttons follow the entry
+	# when it lands in (or moves to) a higher-precedence merge tier (codex F3).
+	row["config_path"] = ClientConfigurator.effective_config_path(client_id)
+	var config_path := String(row["config_path"])
 	var has_path := not config_path.is_empty()
 	var open_config_btn: Button = row["open_config_btn"]
 	var reveal_btn: Button = row["reveal_btn"]

@@ -4262,3 +4262,478 @@ func _restore_client_scope() -> void:
 		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, _saved_client_scope)
 	elif es.has_setting(McpSettings.SETTING_CLIENT_SCOPE):
 		es.erase(McpSettings.SETTING_CLIENT_SCOPE)
+
+
+# ----- capture_project_roots canonicalization (F4) -----
+
+
+func test_canonicalize_roots_collapses_res_and_absolute_for_same_dir() -> void:
+	## Codex F4: when the editor cwd and `res://` globalize to the same directory,
+	## the dedup pass must keep ONE entry — otherwise `_project_candidate_paths`
+	## probes `.pi/mcp.json` against both representations and `manual_target_details`
+	## sees multiple project tiers for what is actually a single override file.
+	var abs_path := ProjectSettings.globalize_path("res://")
+	var roots := McpClientConfigurator._canonicalize_roots_for_test(
+		PackedStringArray(["res://", abs_path])
+	)
+	assert_eq(roots.size(), 1, "res:// form and its absolute twin must collapse to one entry; got %s" % str(roots))
+	assert_eq(roots[0], abs_path.simplify_path(), "canonical form must be the absolute path")
+
+
+func test_canonicalize_roots_preserves_order_and_filters_empty() -> void:
+	## Canonicalization must preserve the input order (the seen dict iterates in
+	## insertion order, so the first occurrence of a unique path wins). Empty
+	## and whitespace-only inputs are dropped before globalize_path is called.
+	var r1 := "/some/where/a"
+	var r2 := "/some/where/b"
+	var r3 := "/some/where/c"
+	var roots := McpClientConfigurator._canonicalize_roots_for_test(
+		PackedStringArray(["", "   ", r1, r2, r3, r1])
+	)
+	assert_eq(roots.size(), 3, "duplicates must dedupe; empties must drop; got %s" % str(roots))
+	assert_eq(roots[0], r1)
+	assert_eq(roots[1], r2)
+	assert_eq(roots[2], r3)
+
+
+func test_canonicalize_roots_handles_res_and_absolute_uniformly() -> void:
+	## `ProjectSettings.globalize_path` accepts `res://` and `user://`; absolute
+	## paths pass through. A mixed batch must all collapse correctly via a
+	## single representation per directory.
+	var abs_res := ProjectSettings.globalize_path("res://").simplify_path()
+	var roots := McpClientConfigurator._canonicalize_roots_for_test(
+		PackedStringArray([
+			abs_res,
+			"res://",
+			abs_res + "/.",  # path that simplifies to abs_res
+		])
+	)
+	assert_eq(roots.size(), 1, "all three representations must collapse to one entry; got %s" % str(roots))
+	assert_eq(roots[0], abs_res)
+
+
+func test_capture_project_roots_returns_unique_non_empty_entries() -> void:
+	## End-to-end: `capture_project_roots` uses the same canonicalize-then-dedup
+	## pass, so the live result is bounded by directory count, not candidate
+	## count. All entries must be non-empty and unique regardless of whether
+	## the editor's cwd matches `res://`.
+	var roots := McpClientConfigurator.capture_project_roots()
+	assert_gt(roots.size(), 0, "capture_project_roots must yield at least one root when running against a project")
+	for i in range(roots.size()):
+		assert_false(roots[i].is_empty(), "root entry must be non-empty")
+		for j in range(i + 1, roots.size()):
+			assert_ne(roots[i], roots[j], "duplicate root after canonicalization: %s" % roots[i])
+
+
+# ----- merge-tier project-status fold (F2) -----
+
+
+func _make_merged_json_client(tier_paths: PackedStringArray, project_paths: PackedStringArray = PackedStringArray([".pi/mcp.json", ".mcp.json"])) -> McpClient:
+	## Build a synthetic JSON client that exercises `_check_status_merged` /
+	## `_configure_merged` / `_remove_merged`. `tier_paths` is the ordered
+	## global merge; `project_paths` are the per-root relative paths under
+	## each entry of `project_roots`.
+	var c := McpClient.new()
+	c.id = "merged_test"
+	c.display_name = "Merged Test"
+	c.config_type = "json"
+	# Pin path_template to the lowest tier so `resolved_config_path()` and the
+	# row-config-path facade have something deterministic to return.
+	c.path_template = {"darwin": tier_paths[0], "windows": tier_paths[0], "linux": tier_paths[0], "unix": tier_paths[0]}
+	c.server_key_path = PackedStringArray(["mcpServers"])
+	c.config_merge_path_templates = {"darwin": tier_paths, "windows": tier_paths, "linux": tier_paths, "unix": tier_paths}
+	c.config_merge_project_paths = project_paths
+	return c
+
+
+func _write_project_tier(scratch_dir: String, project_path: String, entry: Dictionary) -> String:
+	## Write `entry` under `scratch_dir/<project_path>` so `_project_candidate_paths`
+	## can find it. Returns the absolute path written. The leading directory
+	## (e.g. `.pi/` when `project_path == ".pi/mcp.json"`) is created on demand
+	## — `FileAccess.open(WRITE)` doesn't auto-create intermediate dirs.
+	var abs_path := scratch_dir.path_join(project_path)
+	DirAccess.make_dir_recursive_absolute(abs_path.get_base_dir())
+	var f := FileAccess.open(abs_path, FileAccess.WRITE)
+	assert_true(f != null, "failed to open %s for writing" % abs_path)
+	if f != null:
+		f.store_string(JSON.stringify({"mcpServers": {McpClientConfigurator.SERVER_NAME: entry}}))
+		f.close()
+	return abs_path
+
+
+func test_check_status_merged_project_tiers_last_definition_wins() -> void:
+	## Codex F2: with two project tiers, an earlier-stale entry must not flip
+	## the status to MISMATCH when the latest tier matches — pi-codemode-mcp's
+	## documented merge order is last-definition-wins across the project tiers
+	## just like the global tiers.
+	var scratch := _scratch_dir.path_join("f2_last_wins")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	# Earlier tier — stale URL.
+	_write_project_tier(scratch, ".pi/mcp.json", {"url": "http://127.0.0.1:9999/mcp"})
+	# Latest tier — current URL.
+	_write_project_tier(scratch, ".mcp.json", {"url": "http://127.0.0.1:8000/mcp"})
+
+	var client := _make_merged_json_client(
+		PackedStringArray([scratch.path_join("global.json")]),
+		PackedStringArray([".pi/mcp.json", ".mcp.json"]),
+	)
+	var details := McpJsonStrategy.check_status_details(
+		client,
+		McpClientConfigurator.SERVER_NAME,
+		"http://127.0.0.1:8000/mcp",
+		{},
+		PackedStringArray([scratch]),
+	)
+	assert_eq(details.get("status"), McpClient.Status.CONFIGURED, "latest project's configured entry must drive status; got %s" % details.get("error_msg", ""))
+
+
+func test_check_status_merged_project_tiers_latest_mismatch_is_drift() -> void:
+	## When the LATEST project tier is the stale one (because the user has
+	## updated the global tier but not yet refreshed the project override),
+	## status must report CONFIGURED_MISMATCH and the error must name only the
+	## latest path, not every tier in between.
+	var scratch := _scratch_dir.path_join("f2_latest_stale")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	_write_project_tier(scratch, ".pi/mcp.json", {"url": "http://127.0.0.1:8000/mcp"})
+	var latest_path := _write_project_tier(scratch, ".mcp.json", {"url": "http://127.0.0.1:9999/mcp"})
+
+	var client := _make_merged_json_client(
+		PackedStringArray([scratch.path_join("global.json")]),
+		PackedStringArray([".pi/mcp.json", ".mcp.json"]),
+	)
+	var details := McpJsonStrategy.check_status_details(
+		client,
+		McpClientConfigurator.SERVER_NAME,
+		"http://127.0.0.1:8000/mcp",
+		{},
+		PackedStringArray([scratch]),
+	)
+	assert_eq(details.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	var msg: String = details.get("error_msg", "")
+	assert_true(msg.contains(latest_path), "error must name the latest tier path; got: %s" % msg)
+	assert_false(msg.contains(".pi/mcp.json"), "error must NOT name the earlier tier (last-wins); got: %s" % msg)
+
+
+# ----- effective config_path facade (F3) -----
+
+
+func _write_global_tier(path: String, entry: Dictionary) -> void:
+	## Write a single global-tier JSON file containing `entry` under mcpServers.
+	DirAccess.make_dir_recursive_absolute(path.get_base_dir())
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "failed to open %s for writing" % path)
+	if f != null:
+		f.store_string(JSON.stringify({"mcpServers": {McpClientConfigurator.SERVER_NAME: entry}}))
+		f.close()
+
+
+func test_manual_target_details_resolves_highest_precedence_tier() -> void:
+	## Codex F3: when an entry exists in a higher-precedence global tier, the
+	## facade must return that tier's path so dock Open/Reveal land on the
+	## file the entry actually lives in, not the lowest `path_template`.
+	var scratch := _scratch_dir.path_join("f3_highest")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var lowest := scratch.path_join("lowest.json")
+	var highest := scratch.path_join("highest.json")
+	_write_global_tier(highest, {"url": "http://127.0.0.1:8000/mcp"})
+	# Lowest tier left empty so `manual_target_details` must pick `highest`.
+
+	var client := _make_merged_json_client(PackedStringArray([lowest, highest]))
+	var target := McpJsonStrategy.manual_target_details(client, McpClientConfigurator.SERVER_NAME, lowest, PackedStringArray())
+	assert_true(bool(target.get("ok", false)), "manual_target_details must succeed; got %s" % target)
+	assert_eq(str(target.get("path", "")), highest, "facade must return the tier the entry actually lives in")
+
+
+func test_manual_target_details_falls_back_to_path_template() -> void:
+	## When no tier contains the entry, fall back to `path_template` so the dock
+	## still has somewhere to point the Open/Reveal buttons at.
+	var scratch := _scratch_dir.path_join("f3_fallback")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var lowest := scratch.path_join("lowest.json")
+	var highest := scratch.path_join("highest.json")
+	# Neither tier written — empty config files.
+
+	var client := _make_merged_json_client(PackedStringArray([lowest, highest]))
+	var target := McpJsonStrategy.manual_target_details(client, McpClientConfigurator.SERVER_NAME, lowest, PackedStringArray())
+	assert_true(bool(target.get("ok", false)), "manual_target_details must succeed when no tier has the entry; got %s" % target)
+	assert_eq(str(target.get("path", "")), lowest, "must fall back to the supplied fallback_path (path_template value)")
+
+
+func test_effective_config_path_empty_for_unknown_id() -> void:
+	## The facade must return "" for an unknown id rather than crashing or
+	## silently returning `path_template`. Regression for the thin bridge between
+	## the dock's row-id and `manual_target_details`.
+	assert_eq(McpClientConfigurator.effective_config_path("definitely_not_registered"), "")
+
+
+# ----- external cwd EditorSetting + configure caveat (F1) -----
+
+
+const _SETTING_EXTERNAL_CLIENT_CWD_KEY := "godot_ai/external_client_cwd"
+
+
+func _with_external_cwd_setting(value: String, body: Callable) -> void:
+	## Snapshot-restore wrapper for the `godot_ai/external_client_cwd` setting.
+	## Saves the prior value + presence flag, sets the new value, runs `body`,
+	## then restores — even if `body` fails. Inline pattern mirrors the
+	## port/client_scope dance at the top of the suite without needing a
+	## `defer_call` (the test base class has none).
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		body.call()
+		return
+	var had_setting := es.has_setting(_SETTING_EXTERNAL_CLIENT_CWD_KEY)
+	var prior: Variant = null
+	if had_setting:
+		prior = es.get_setting(_SETTING_EXTERNAL_CLIENT_CWD_KEY)
+	es.set_setting(_SETTING_EXTERNAL_CLIENT_CWD_KEY, value)
+	# Warm the snapshot so `_editor_setting_lookup` returns the new value to any
+	# thread that consults the snapshot afterwards.
+	McpClientConfigurator._editor_setting_lookup(_SETTING_EXTERNAL_CLIENT_CWD_KEY)
+	body.call()
+	if had_setting:
+		es.set_setting(_SETTING_EXTERNAL_CLIENT_CWD_KEY, prior)
+	else:
+		es.erase(_SETTING_EXTERNAL_CLIENT_CWD_KEY)
+	McpClientConfigurator._editor_setting_lookup(_SETTING_EXTERNAL_CLIENT_CWD_KEY)
+
+
+func test_capture_project_roots_includes_external_client_cwd() -> void:
+	## Codex F1: when `godot_ai/external_client_cwd` is set, `capture_project_roots`
+	## includes that directory in its returned roots so project overrides there are
+	## actually probed instead of silently shadowed a global-tier write.
+	var scratch := _scratch_dir.path_join("f1_external_cwd")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	_with_external_cwd_setting(scratch, func():
+		var roots := McpClientConfigurator.capture_project_roots()
+		var found := false
+		for r in roots:
+			if r == scratch:
+				found = true
+				break
+		assert_true(found, "capture_project_roots must include %s when the setting is set; got %s" % [scratch, str(roots)])
+	)
+
+
+func test_configure_merged_caveat_when_external_unset() -> void:
+	## Codex F1: when a successful configure can't see any project override AND
+	## the user hasn't told us the external cwd, the result message must include
+	## the actionable caveat instead of a bare "configured".
+	_with_external_cwd_setting("", func():
+		var scratch := _scratch_dir.path_join("f1_caveat_unset")
+		DirAccess.make_dir_recursive_absolute(scratch)
+		var global_path := scratch.path_join("global.json")
+		_write_global_tier(global_path, {"url": "http://127.0.0.1:8000/mcp"})
+
+		var client := _make_merged_json_client(PackedStringArray([global_path]))
+		var result := McpJsonStrategy.configure(
+			client,
+			McpClientConfigurator.SERVER_NAME,
+			"http://127.0.0.1:8000/mcp",
+			{},
+			PackedStringArray(),
+		)
+		assert_eq(result.get("status"), "ok")
+		var msg: String = result.get("message", "")
+		assert_true(
+			msg.contains("external_client_cwd"),
+			"result message must carry the F1 caveat when the setting is empty; got: %s" % msg,
+		)
+	)
+
+
+func test_configure_merged_caveat_absent_when_external_set() -> void:
+	## With the external cwd explicitly set, the user has acknowledged the
+	## potential blind spot — no need to nag on every configure. Result message
+	## stays the standard `configured_message` without the caveat.
+	var scratch := _scratch_dir.path_join("f1_caveat_set")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var global_path := scratch.path_join("global.json")
+	_write_global_tier(global_path, {"url": "http://127.0.0.1:8000/mcp"})
+	_with_external_cwd_setting(scratch, func():
+		var client := _make_merged_json_client(PackedStringArray([global_path]))
+		var result := McpJsonStrategy.configure(
+			client,
+			McpClientConfigurator.SERVER_NAME,
+			"http://127.0.0.1:8000/mcp",
+			{},
+			PackedStringArray(),
+		)
+		assert_eq(result.get("status"), "ok")
+		var msg: String = result.get("message", "")
+		assert_false(
+			msg.contains("external_client_cwd"),
+			"caveat must NOT appear when the user has set the cwd; got: %s" % msg,
+		)
+	)
+
+
+# ----- token-preserving remove + refuse lossy ints (F5) -----
+
+
+func _write_raw_json(path: String, body: String) -> void:
+	## Write `body` verbatim to `path` so the test can use literals that JSON
+	## round-tripping would normalise (different whitespace, key order, etc.).
+	DirAccess.make_dir_recursive_absolute(path.get_base_dir())
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	assert_true(f != null, "failed to open %s for writing" % path)
+	if f != null:
+		f.store_string(body)
+		f.close()
+
+
+func _read_raw_json(path: String) -> String:
+	var f := FileAccess.open(path, FileAccess.READ)
+	assert_true(f != null, "failed to open %s for reading" % path)
+	var content := ""
+	if f != null:
+		content = f.get_as_text()
+		f.close()
+	return content
+
+
+func test_json_strategy_remove_preserves_unrelated_integers_above_2_53() -> void:
+	## Codex F5 (simple path): a JSON file containing an integer above 2^53 must
+	## come back byte-for-byte identical (modulo the removed entry block) after
+	## Remove, even though Godot's JSON.parse stores the value as a lossy float.
+	var scratch := _scratch_dir.path_join("f5_simple_preserve")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var path := scratch.path_join("big_id.json")
+	# `bigId` is one above 2^53 — Godot parses it to an imprecise float that
+	# `_narrow_integral_numbers` would NOT round-trip back to a literal. A
+	# re-serialising Remove would emit `9.007199254740993e+15` or similar.
+	var body := (
+		"{\n"
+		+ "\t\"settings\": {\n"
+		+ "\t\t\"bigId\": 9007199254740993,\n"
+		+ "\t\t\"keep\": \"value\"\n"
+		+ "\t},\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	_write_raw_json(path, body)
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.remove(client, McpClientConfigurator.SERVER_NAME)
+	assert_eq(result.get("status"), "ok", "remove must succeed; got %s" % result.get("message", ""))
+	var after := _read_raw_json(path)
+	assert_true(after.contains('"bigId": 9007199254740993'), "bigId literal must survive byte-for-byte; got: %s" % after)
+	assert_true(after.contains('"keep": "value"'), "unrelated setting must survive; got: %s" % after)
+	assert_false(after.contains('"bigId": 9.00719925474099'), "bigId must NOT be re-emitted as a float literal; got: %s" % after)
+
+
+func test_json_strategy_pi_merge_remove_preserves_unrelated_integers_above_2_53() -> void:
+	## Same coverage as the simple path, but for the merge-tier Remove path.
+	var scratch := _scratch_dir.path_join("f5_merge_preserve")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var highest := scratch.path_join("highest.json")
+	var lowest := scratch.path_join("lowest.json")
+	# Highest tier carries our server + an unrelated lossy integer.
+	_write_raw_json(highest, "{\n\t\"mcpServers\": {\n\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n\t},\n\t\"bigId\": 9007199254740993\n}\n")
+	# Lowest tier has nothing relevant — kept to verify it's untouched.
+	_write_raw_json(lowest, "{\n\t\"mcpServers\": {}\n}\n")
+	var client := _make_merged_json_client(PackedStringArray([lowest, highest]))
+	var result := McpJsonStrategy.remove(client, McpClientConfigurator.SERVER_NAME)
+	assert_eq(result.get("status"), "ok", "merge-remove must succeed; got %s" % result.get("message", ""))
+	var highest_after := _read_raw_json(highest)
+	assert_true(highest_after.contains('"bigId": 9007199254740993'), "highest tier bigId literal must survive; got: %s" % highest_after)
+	assert_false(highest_after.contains(McpClientConfigurator.SERVER_NAME), "our server entry must be removed from highest tier")
+	var lowest_after := _read_raw_json(lowest)
+	assert_eq(lowest_after, "{\n\t\"mcpServers\": {}\n}\n", "lowest tier must be untouched")
+
+
+func test_json_strategy_pi_merge_remove_omits_only_target_entry() -> void:
+	## A file with our entry plus several unrelated keys; Remove must produce a
+	## file whose every other key is byte-for-byte identical to what we wrote.
+	var scratch := _scratch_dir.path_join("f5_merge_only_target")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var tier := scratch.path_join("only_target.json")
+	var body := (
+		"{\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"keep-me\": {\"url\": \"http://other/\"},\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n"
+		+ "\t},\n"
+		+ "\t\"alpha\": 1,\n"
+		+ "\t\"beta\": \"two\"\n"
+		+ "}\n"
+	)
+	_write_raw_json(tier, body)
+	var client := _make_merged_json_client(PackedStringArray([tier]))
+	var result := McpJsonStrategy.remove(client, McpClientConfigurator.SERVER_NAME)
+	assert_eq(result.get("status"), "ok")
+	var after := _read_raw_json(tier)
+	assert_true(after.contains('"keep-me"'), "unrelated server must survive; got: %s" % after)
+	assert_true(after.contains('"alpha": 1'), "unrelated key must survive; got: %s" % after)
+	assert_true(after.contains('"beta": "two"'), "unrelated key must survive; got: %s" % after)
+	assert_false(after.contains(McpClientConfigurator.SERVER_NAME), "our server entry must be gone")
+
+
+func test_json_strategy_configure_refuses_when_file_has_lossy_numbers() -> void:
+	## F5 (simple path): configure must fail closed when the file contains an
+	## integer above 2^53, and the file must be byte-for-byte unchanged.
+	var scratch := _scratch_dir.path_join("f5_simple_refuse")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var path := scratch.path_join("lossy.json")
+	var body := (
+		"{\n"
+		+ "\t\"bigId\": 9007199254740993,\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:9000/mcp\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	_write_raw_json(path, body)
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.configure(client, McpClientConfigurator.SERVER_NAME, "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "error", "configure must refuse a lossy file; got %s" % result.get("message", ""))
+	assert_true(
+		str(result.get("message", "")).contains("2^53") or str(result.get("message", "")).contains("imprecise"),
+		"refusal message must explain why; got: %s" % result.get("message", ""),
+	)
+	assert_eq(_read_raw_json(path), body, "the file must NOT be mutated on refusal")
+
+
+func test_json_strategy_pi_merge_configure_refuses_when_file_has_lossy_numbers() -> void:
+	## F5 (merge path): same refusal contract as the simple path.
+	var scratch := _scratch_dir.path_join("f5_merge_refuse")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var tier := scratch.path_join("lossy.json")
+	var body := (
+		"{\n"
+		+ "\t\"bigId\": 9007199254740993,\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:9000/mcp\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	_write_raw_json(tier, body)
+	var client := _make_merged_json_client(PackedStringArray([tier]))
+	var result := McpJsonStrategy.configure(client, McpClientConfigurator.SERVER_NAME, "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "error", "merge-configure must refuse a lossy tier; got %s" % result.get("message", ""))
+	assert_eq(_read_raw_json(tier), body, "the tier must NOT be mutated on refusal")
+
+
+func test_text_remove_server_entry_is_byte_for_byte_outside_target() -> void:
+	## Direct coverage of the new helper. Whole bytes outside the entry block
+	## (including whitespace, comments-shape unused keys, and a literal above
+	## 2^53) must survive verbatim.
+	var helper := McpJsonStrategy
+	var body := (
+		"{\n"
+		+ "\t\"settings\": {\"bigId\": 9007199254740993},\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"keep\": {\"url\": \"http://other/\"},\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	assert_false(updated.contains(McpClientConfigurator.SERVER_NAME), "entry must be removed")
+	assert_true(updated.contains('"bigId": 9007199254740993'), "lossy integer literal must survive; got: %s" % updated)
+	assert_true(updated.contains('"keep": {"url": "http://other/"}'), "unrelated entry must survive verbatim; got: %s" % updated)
+	# The result must still parse as valid JSON.
+	var parsed = JSON.parse_string(updated)
+	assert_true(parsed is Dictionary, "result must remain valid JSON")
+	assert_false((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME), "our server must not appear")

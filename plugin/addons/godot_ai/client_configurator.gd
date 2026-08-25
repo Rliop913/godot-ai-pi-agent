@@ -47,6 +47,12 @@ const SUGGEST_PORT_MAX_PROBES := 64
 const SETTING_WS_PORT := "godot_ai/ws_port"
 const SETTING_STARTUP_TRACE := "godot_ai/log_startup_timing"
 const SETTING_KEEP_SERVER_ON_EXIT := "godot_ai/keep_server_on_exit"
+## External cwd the user can set when an MCP client (Pi, code-server, …) reads
+## project-tier config files from a directory this editor can't see. The
+## merge-tier strategies include it as an extra `_project_candidate_paths` root
+## so project overrides there are detected instead of silently shadowed by a
+## global-tier write. Codex-review finding F1.
+const SETTING_EXTERNAL_CLIENT_CWD := "godot_ai/external_client_cwd"
 const _DISCOVERY_TIMEOUT_MS := 3000
 ## Codex launches Windows console-subsystem MCP commands in a visible terminal.
 ## A GUI-subsystem Python keeps the bridge attached to Codex's redirected MCP
@@ -112,6 +118,7 @@ static func ensure_settings_registered() -> void:
 	_register_bool_setting(es, SETTING_STARTUP_TRACE, false)
 	_register_bool_setting(es, SETTING_KEEP_SERVER_ON_EXIT, false)
 	_register_client_scope_setting(es)
+	_register_string_setting(es, SETTING_EXTERNAL_CLIENT_CWD, "")
 
 
 static func _register_port_setting(es: EditorSettings, key: String, default_port: int) -> void:
@@ -149,6 +156,21 @@ static func _register_bool_setting(es: EditorSettings, key: String, default_valu
 	es.add_property_info({
 		"name": key,
 		"type": TYPE_BOOL,
+	})
+
+
+static func _register_string_setting(es: EditorSettings, key: String, default_value: String) -> void:
+	## Same idempotent set-then-hint dance as the bool helper; `PROPERTY_HINT_NONE`
+	## leaves the editor's plain text-input widget in place (the cwd string is
+	## freeform). The hint-string slot is required by the API even when empty.
+	if not es.has_setting(key):
+		es.set_setting(key, default_value)
+	es.set_initial_value(key, default_value, false)
+	es.add_property_info({
+		"name": key,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_NONE,
+		"hint_string": "",
 	})
 
 
@@ -281,14 +303,40 @@ static func capture_launch_context() -> Dictionary:
 ## Resolve roots used by cwd-relative client project config tiers while the
 ## engine singletons are safe to access. Workers receive this immutable snapshot.
 static func capture_project_roots() -> PackedStringArray:
-	var roots := PackedStringArray()
 	var current_access := DirAccess.open(".")
 	var current_root := "" if current_access == null else current_access.get_current_dir().simplify_path()
 	var project_root := ProjectSettings.globalize_path("res://").simplify_path()
-	for candidate in [current_root, project_root]:
-		var root := str(candidate)
-		if not root.is_empty() and not roots.has(root):
-			roots.append(root)
+	# Codex F1: when the user sets `godot_ai/external_client_cwd` we probe that
+	# directory in addition to the two guessed roots. The setter / setter-snapshot
+	# pathway is the same as the existing EditorSettings (warm_env_snapshot
+	# pre-warms this key so worker-thread callers see the snapshot, not the live
+	# EditorInterface). Empty string is filtered out by `_canonicalize_roots_for_test`.
+	var external_cwd := str(_editor_setting_lookup(SETTING_EXTERNAL_CLIENT_CWD))
+	return _canonicalize_roots_for_test(PackedStringArray([current_root, project_root, external_cwd]))
+
+
+## Canonicalize a list of root paths to one filesystem representation per
+## directory and deduplicate. `ProjectSettings.globalize_path` maps any
+## `res://` / `user://` form to the absolute path and is idempotent on an
+## already-absolute path, so a `res://`-form candidate and its absolute twin
+## collapse to the same entry. Without this pass, `_project_candidate_paths`
+## would probe `<root>/.pi/mcp.json` against both representations of the same
+## directory and `manual_target_details` would mis-report a single project
+## override as multiple tiers (codex-review finding F4). Public-ish seam
+## (named `_..._for_test`) so the clients suite can pin the behaviour without
+## having to mock `DirAccess.open(".")`.
+static func _canonicalize_roots_for_test(raws: PackedStringArray) -> PackedStringArray:
+	var seen := {}
+	var roots := PackedStringArray()
+	for raw in raws:
+		var s := str(raw).strip_edges()
+		if s.is_empty():
+			continue
+		var canon := ProjectSettings.globalize_path(s).simplify_path()
+		if canon.is_empty() or seen.has(canon):
+			continue
+		seen[canon] = true
+		roots.append(canon)
 	return roots
 
 
@@ -478,6 +526,7 @@ static func warm_env_snapshot() -> void:
 	_editor_setting_lookup(MODE_OVERRIDE_SETTING)
 	_editor_setting_lookup(SETTING_STARTUP_TRACE)
 	_editor_setting_lookup(SETTING_KEEP_SERVER_ON_EXIT)
+	_editor_setting_lookup(SETTING_EXTERNAL_CLIENT_CWD)
 	McpSettings.warm_client_scope()
 	# Publish the complete launch context while EditorInterface access is safe;
 	# worker callers of capture_launch_context() read this snapshot only.
@@ -929,6 +978,29 @@ static func manual_command(id: String) -> String:
 static func config_path(id: String) -> String:
 	var client := ClientRegistry.get_by_id(id)
 	return client.resolved_config_path() if client != null else ""
+
+
+## Resolve the highest-precedence config tier that actually contains the server
+## entry. For Pi-style merge clients, returns the tier path the entry lives in
+## (e.g. `~/.pi/agent/.mcp.json`) instead of the lowest-tier `path_template`
+## `config_path()` returns. Falls back to `path_template` when no entry is
+## found anywhere. Empty `launch_context` is allowed; command-shape clients
+## synthesize one via `capture_launch_context()` so dock row construction can
+## call this without first capturing launch state.
+static func effective_config_path(id: String, launch_context: Dictionary = {}) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null:
+		return ""
+	var resolution := client.resolved_config_path_details()
+	var fallback := str(resolution.get("path", ""))
+	var context := launch_context
+	if context.is_empty() and client.command_shape != Client.CommandShape.NONE:
+		context = capture_launch_context()
+	var roots := _project_roots_from_context(context)
+	var target := JsonStrategy.manual_target_details(client, SERVER_NAME, fallback, roots)
+	if bool(target.get("ok", false)):
+		return str(target.get("path", fallback))
+	return fallback
 
 
 static func is_installed(id: String) -> bool:
