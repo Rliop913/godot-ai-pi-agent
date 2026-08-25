@@ -4466,6 +4466,80 @@ func test_effective_config_path_empty_for_unknown_id() -> void:
 	assert_eq(McpClientConfigurator.effective_config_path("definitely_not_registered"), "")
 
 
+# ----- effective_authoritative_path (F-3-4) -----
+# F-3-4 fixes the dock Open/Reveal buttons to land on the same file
+# `_check_status_merged` considers authoritative. Before this, the dock
+# used `effective_config_path` which failed closed on multiple project
+# tiers and fell back to the lowest global `path_template` — sending
+# users to `~/.pi/agent/mcp.json` when the status check said `.mcp.json`
+# was driving Pi. These tests pin the new facade's last-wins behavior.
+
+func test_authoritative_tier_path_returns_latest_project_tier() -> void:
+	## F-3-4 (algorithm): two project tiers, both containing godot-ai, must
+	## resolve to the LATEST tier (matching F2 status semantics). Tested
+	## directly via `McpJsonStrategy.authoritative_tier_path` because the
+	## public facade goes through `ClientRegistry.get_by_id` which only
+	## knows about real registered clients; the synthetic
+	## `_make_merged_json_client` has a `merged_test` id that's not
+	## registered.
+	var scratch := _scratch_dir.path_join("f34_latest_project")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	_write_project_tier(scratch, ".pi/mcp.json", {"url": "http://127.0.0.1:9999/mcp"})
+	var latest_path := _write_project_tier(scratch, ".mcp.json", {"url": "http://127.0.0.1:8000/mcp"})
+	var client := _make_merged_json_client(PackedStringArray([scratch.path_join("global.json")]))
+	var auth_path: String = McpJsonStrategy.authoritative_tier_path(
+		client, McpClientConfigurator.SERVER_NAME, PackedStringArray([scratch])
+	)
+	assert_eq(auth_path, latest_path, "must return the latest project tier (F-3-4 last-wins); got: %s" % auth_path)
+
+func test_authoritative_tier_path_falls_back_to_highest_global_tier() -> void:
+	## F-3-4 (algorithm): no project tier, multiple global tiers with the
+	## entry — the last-iterated-wins global tier wins (same loop pattern
+	## as `manual_target_details`).
+	var scratch := _scratch_dir.path_join("f34_latest_global")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var lower := scratch.path_join("low.json")
+	var higher := scratch.path_join("high.json")
+	_write_raw_json(lower, "{\n\t\"mcpServers\": {\n\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n\t}\n}\n")
+	_write_raw_json(higher, "{\n\t\"mcpServers\": {\n\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n\t}\n}\n")
+	var client := _make_merged_json_client(PackedStringArray([lower, higher]))
+	var auth_path: String = McpJsonStrategy.authoritative_tier_path(
+		client, McpClientConfigurator.SERVER_NAME, PackedStringArray()
+	)
+	assert_eq(auth_path, higher, "must return the last-iterated global tier (F-3-4); got: %s" % auth_path)
+	assert_true(FileAccess.file_exists(auth_path), "returned path must exist; got: %s" % auth_path)
+
+
+func test_authoritative_tier_path_returns_empty_when_no_entry_anywhere() -> void:
+	## F-3-4 (algorithm): no project tier, no entry in any global tier —
+	## helper returns "" and lets the facade decide the fallback
+	## (`path_template`).
+	var scratch := _scratch_dir.path_join("f34_no_entry")
+	DirAccess.make_dir_recursive_absolute(scratch)
+	var lower := scratch.path_join("low.json")
+	var higher := scratch.path_join("high.json")
+	_write_raw_json(lower, "{\n\t\"mcpServers\": {}\n}\n")
+	_write_raw_json(higher, "{\n\t\"mcpServers\": {}\n}\n")
+	var client := _make_merged_json_client(PackedStringArray([lower, higher]))
+	var auth_path: String = McpJsonStrategy.authoritative_tier_path(
+		client, McpClientConfigurator.SERVER_NAME, PackedStringArray()
+	)
+	assert_eq(auth_path, "", "must return empty when no entry anywhere; got: %s" % auth_path)
+
+
+func test_effective_authoritative_path_facade_wires_through_for_registered_client() -> void:
+	## F-3-4 (wiring): the public facade must look up the client via
+	## `ClientRegistry.get_by_id` and return a non-empty string for a
+	## registered client. Either the authoritative tier (if Pi's merge
+	## paths exist on disk) or the `path_template` fallback is acceptable
+	## here — we test the wiring, not Pi's specific disk state.
+	var client: McpClient = McpClientRegistry.get_by_id("pi")
+	assert_true(client != null, "pi must be a registered client; got null")
+	var auth_path: String = McpClientConfigurator.effective_authoritative_path("pi")
+	assert_false(auth_path.is_empty(), "facade must return non-empty for registered client; got empty")
+	assert_eq(McpClientConfigurator.effective_authoritative_path("definitely_not_registered"), "")
+
+
 # ----- external cwd EditorSetting + configure caveat (F1) -----
 
 
@@ -4737,3 +4811,151 @@ func test_text_remove_server_entry_is_byte_for_byte_outside_target() -> void:
 	var parsed = JSON.parse_string(updated)
 	assert_true(parsed is Dictionary, "result must remain valid JSON")
 	assert_false((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME), "our server must not appear")
+
+
+# ----- F5 scanner regression: middle-position + sibling-collision coverage -----
+# The first F5 round's byte-surgery only exercised first/last positions and a
+# single top-level container. Codex review (second round) confirmed two latent
+# bugs in `_text_remove_server_entry`:
+#   (a) middle-position entries produced `"x"}"y"` with no separator because
+#       both leading and trailing commas were trimmed unconditionally;
+#   (b) `_find_key_at_container_depth` kept scanning past a closed target
+#       container, so a later sibling container at the same level (e.g. an
+#       `extensions` block after `mcpServers`) re-balanced the depth counter
+#       to 0 and any same-named key in that sibling was picked up — silent
+#       data loss. The following legs pin both fixes.
+
+func test_text_remove_server_entry_middle_position_removes_only_target() -> void:
+	## F5 (round 2, bug a): a middle-position entry must delete ONLY its own
+	## bytes + the trailing comma. The previous-implementation output was
+	## `{"a": {...}"b": {...}}` (invalid JSON, comma between siblings gone).
+	var helper := McpJsonStrategy
+	var body := '{"mcpServers": {"a": {"command": "x"}, "' + McpClientConfigurator.SERVER_NAME + '": {"command": "y"}, "b": {"command": "z"}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	# Result must remain valid JSON and keep BOTH siblings.
+	var parsed: Variant = JSON.parse_string(updated)
+	assert_true(parsed is Dictionary, "middle-position removal must yield valid JSON; got: %s" % updated)
+	assert_true((parsed as Dictionary)["mcpServers"].has("a"), "'a' sibling must survive; got: %s" % updated)
+	assert_true((parsed as Dictionary)["mcpServers"].has("b"), "'b' sibling must survive; got: %s" % updated)
+	assert_false((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME), "target must be gone; got: %s" % updated)
+	# Spot-check the exact produced bytes — no missing separator.
+	assert_true(updated.contains('"a": {"command": "x"}, "b"'), "comma between siblings must survive; got: %s" % updated)
+
+
+func test_text_remove_server_entry_middle_position_preserves_unrelated_lossy_int() -> void:
+	## F5 (round 2, combined): middle-position removal must NOT corrupt an
+	## unrelated integer above 2^53 anywhere else in the file. This is the
+	## real-world F5 scenario combined with the new bug-a fix.
+	var helper := McpJsonStrategy
+	var body := (
+		"{\n"
+		+ "\t\"settings\": {\"bigId\": 9007199254740993},\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"a\": {\"command\": \"x\"},\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"command\": \"y\"},\n"
+		+ "\t\t\"b\": {\"command\": \"z\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	assert_true(updated.contains('"bigId": 9007199254740993'), "lossy integer literal must survive byte-for-byte; got: %s" % updated)
+	assert_false(updated.contains('"bigId": 9.00719925474099'), "lossy integer must NOT be re-emitted as float; got: %s" % updated)
+	# Verify the sibling separator (comma between 'a' and 'b') survives.
+	# Note: the input has a newline+tab between the comma and the next key's
+	# quote, so we check the parsed JSON shape rather than a substring of the
+	# raw bytes.
+	var parsed2: Variant = JSON.parse_string(updated)
+	assert_true(parsed2 is Dictionary, "result must be valid JSON; got: %s" % updated)
+	var mcpServers2: Dictionary = (parsed2 as Dictionary)["mcpServers"]
+	assert_true(mcpServers2.has("a"), "'a' sibling must survive; got: %s" % updated)
+	assert_true(mcpServers2.has("b"), "'b' sibling must survive; got: %s" % updated)
+	assert_false(mcpServers2.has(McpClientConfigurator.SERVER_NAME), "target must be gone; got: %s" % updated)
+	# Spot-check: the comma between siblings appears in the raw text — proves
+	# the middle-position comma wasn't double-trimmed.
+	assert_true(updated.contains(','), "at least one comma must remain between siblings; got: %s" % updated)
+
+
+func test_text_remove_server_entry_target_container_has_no_match_returns_unchanged() -> void:
+	## F5 (round 2, bug b): if the target container doesn't hold the entry, the
+	## scanner must NOT fall through to a later sibling container at the same
+	## level. Without the inner_depth < 0 guard, a same-named key in e.g. an
+	## `extensions` block would be silently deleted.
+	var helper := McpJsonStrategy
+	var body := '{"mcpServers": {"other": {}}, "extensions": {"' + McpClientConfigurator.SERVER_NAME + '": {"pinned": true}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	assert_eq(updated, body, "no match in target container must be a no-op; got: %s" % updated)
+	# And critically: extensions." + SERVER_NAME must STILL exist.
+	assert_true(updated.contains('"extensions": {'), "extensions block must survive; got: %s" % updated)
+	assert_true(updated.contains('"extensions": {"' + McpClientConfigurator.SERVER_NAME + '":'), "extensions." + McpClientConfigurator.SERVER_NAME + " must survive (sibling not deleted); got: %s" % updated)
+
+
+func test_text_remove_server_entry_sibling_collision_deletes_only_target() -> void:
+	## F5 (round 2, combined): when the entry exists in BOTH the target
+	## container AND a later sibling container, only the target one must be
+	## deleted. The inner_depth < 0 guard prevents the scanner from re-entering
+	## the sibling after the target container closes.
+	var helper := McpJsonStrategy
+	var body := '{"mcpServers": {"' + McpClientConfigurator.SERVER_NAME + '": {"url": "http://127.0.0.1:8000/mcp"}, "keep": {"url": "http://other/"}}, "extensions": {"' + McpClientConfigurator.SERVER_NAME + '": {"pinned": true}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	var parsed: Variant = JSON.parse_string(updated)
+	assert_true(parsed is Dictionary, "result must be valid JSON; got: %s" % updated)
+	assert_false((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME), "target container's entry must be gone; got: %s" % updated)
+	assert_true((parsed as Dictionary)["mcpServers"].has("keep"), "sibling key inside mcpServers must survive; got: %s" % updated)
+	assert_true((parsed as Dictionary)["extensions"].has(McpClientConfigurator.SERVER_NAME), "extensions." + McpClientConfigurator.SERVER_NAME + " must SURVIVE (sibling collision guard); got: %s" % updated)
+
+
+# ----- F-3-6: UTF-8 BOM skip -----
+# Windows editors (Notepad, some VSCode configs) save JSON with a leading
+# UTF-8 BOM (U+FEFF, bytes 0xEF 0xBB 0xBF). `_read_file_text` strips the BOM
+# only from the parse copy, leaving it in `original_text`. Before F-3-6,
+# `_text_remove_server_entry` only skipped JSON whitespace, so the cursor
+# landed on the BOM byte 0xEF and the `{` check failed — Remove silently
+# left the entry in place. F-3-6 makes the scanner also skip the BOM. The
+# BOM itself must stay in the file (byte-survival F5 contract).
+
+func test_text_remove_server_entry_skips_utf8_bom() -> void:
+	## F-3-6 (single entry): file with leading BOM must have its entry
+	## removed AND the BOM preserved in the resulting file.
+	var helper := McpJsonStrategy
+	var body := "﻿" + '{"mcpServers": {"' + McpClientConfigurator.SERVER_NAME + '": {"url": "http://127.0.0.1:8000/mcp"}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	assert_true(updated.begins_with("﻿"), "BOM must survive byte-for-byte; got first bytes: %s" % updated.substr(0, 8))
+	assert_false(updated.contains(McpClientConfigurator.SERVER_NAME), "entry must be removed; got: %s" % updated)
+	# Strip the BOM before parsing — GDScript's `JSON.parse_string` rejects a
+	# leading BOM. This mirrors what `_read_file_text` does for the parse copy.
+	var parse_copy: String = updated
+	if parse_copy.begins_with("﻿"):
+		parse_copy = parse_copy.substr(1)
+	var parsed: Variant = JSON.parse_string(parse_copy)
+	assert_true(parsed is Dictionary, "result must be valid JSON; got: %s" % updated)
+
+
+func test_text_remove_server_entry_bom_with_middle_position_entry() -> void:
+	## F-3-6 + F5 round 2 bug-a: middle-position removal must still preserve
+	## the sibling separator, even with a leading BOM. Catches regressions
+	## where a future refactor to the root-skip block re-orders the BOM
+	## check ahead of the cursor advance.
+	var helper := McpJsonStrategy
+	var body := "﻿" + '{"mcpServers": {"a": {"command": "x"}, "' + McpClientConfigurator.SERVER_NAME + '": {"command": "y"}, "b": {"command": "z"}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	assert_true(updated.begins_with("﻿"), "BOM must survive; got: %s" % updated.substr(0, 8))
+	# Strip the BOM before parsing (parser can't handle it).
+	var parse_copy: String = updated
+	if parse_copy.begins_with("﻿"):
+		parse_copy = parse_copy.substr(1)
+	var parsed: Variant = JSON.parse_string(parse_copy)
+	assert_true(parsed is Dictionary, "result must be valid JSON; got: %s" % updated)
+	var mcp: Dictionary = (parsed as Dictionary)["mcpServers"]
+	assert_true(mcp.has("a"), "'a' sibling must survive; got: %s" % updated)
+	assert_true(mcp.has("b"), "'b' sibling must survive; got: %s" % updated)
+	assert_false(mcp.has(McpClientConfigurator.SERVER_NAME), "target must be gone; got: %s" % updated)
+	assert_true(updated.contains(','), "comma between siblings must survive; got: %s" % updated)
+
+
+func test_text_remove_server_entry_bom_no_match_returns_unchanged() -> void:
+	## F-3-6 safe no-op: a file with BOM but no godot-ai entry must come back
+	## byte-for-byte unchanged (no spurious mutation).
+	var helper := McpJsonStrategy
+	var body := "﻿" + '{"mcpServers": {"other": {"command": "x"}}}'
+	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
+	assert_eq(updated, body, "no-op must leave file byte-for-byte identical; got: %s" % updated)

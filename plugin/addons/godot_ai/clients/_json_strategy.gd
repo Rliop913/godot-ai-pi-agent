@@ -629,6 +629,55 @@ static func _write_transaction(writes: Array[Dictionary]) -> Dictionary:
 			suffix = " Rollback also failed for: %s" % ", ".join(rollback_failed)
 		return {"ok": false, "error": "Cannot write to %s; earlier tier changes were rolled back.%s" % [path, suffix]}
 	return {"ok": true}
+## Path that `_check_status_merged`'s last-wins logic would consider
+## authoritative for the server entry, or "" when no entry is found in
+## any tier. Mirrors the same project-tier / global-tier resolution the
+## status check uses so callers (notably the dock Open/Reveal buttons)
+## land on the file that actually drives Pi's effective config.
+##
+## Resolution order (codex round 3, F-3-4):
+##   1. Latest project tier containing the entry — F2 last-wins means the
+##      latest of `.pi/mcp.json` and `.mcp.json` wins (matches `_check_status_merged`).
+##   2. Latest global tier containing the entry — already iterated in
+##      merge order, last-iterated-wins (same loop pattern as
+##      `manual_target_details` lines 660-665).
+##   3. "" when no tier has the entry — caller decides what fallback
+##      (`path_template`) to use.
+##
+## Returns "" (not `path_template`) on the "nothing anywhere" branch so
+## the dock can distinguish "no entry yet" from "entry is at the
+## template path" if it wants to.
+static func authoritative_tier_path(
+	client: McpClient,
+	server_name: String,
+	project_roots: PackedStringArray,
+) -> String:
+	if not _uses_merge_tiers(client):
+		return ""
+	var project := _load_project_definitions(client, server_name, project_roots)
+	if not bool(project.get("ok", false)):
+		return ""
+	var project_tiers: Array = project.get("tiers", [])
+	if not project_tiers.is_empty():
+		# F2 last-wins: latest project tier is authoritative. When there are
+		# multiple project tiers, the user-visible status is driven by the
+		# latest, so the Open/Reveal buttons should send them there too.
+		var latest: Dictionary = project_tiers[project_tiers.size() - 1]
+		return str(latest.get("path", ""))
+	var loaded := _load_merge_tiers(client)
+	if not bool(loaded.get("ok", false)):
+		return ""
+	var tiers: Array = loaded.get("tiers", [])
+	# Iterate in priority order, overwrite `selected_path` each time we
+	# find a tier containing the entry. With Pi's merge path order
+	# [mcp.json, .mcp.json] this leaves the higher-precedence `.mcp.json`.
+	var selected_path: String = ""
+	for tier in tiers:
+		var data: Dictionary = tier.get("data", {})
+		var holder: Variant = _walk_path(data, select_server_key_path(data, client))
+		if holder is Dictionary and holder.has(server_name):
+			selected_path = str(tier.get("path", ""))
+	return selected_path
 
 
 ## Pick the file and top-level map shown by the manual JSON instructions using
@@ -745,19 +794,26 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 	# container that holds our entry, and `container_depth` tracks how deeply
 	# nested that container is from the root (0 = root object/array).
 	var cursor := 0
-	# Skip past the root's opening `{` or `[` (and any leading whitespace) so
-	# `_find_key_at_container_depth` starts scanning from inside the root
-	# container with `inner_depth == 0`. Without this step, the first character
-	# encountered is the root's `{`, which bumps `inner_depth` to 1 and makes
-	# the top-level key check fail.
+	# Skip past the root's opening `{` or `[` (and any leading whitespace or
+	# UTF-8 BOM) so `_find_key_at_container_depth` starts scanning from
+	# inside the root container with `inner_depth == 0`. Without this step,
+	# the first character encountered is the root's `{`, which bumps
+	# `inner_depth` to 1 and makes the top-level key check fail. The BOM
+	# skip mirrors `_read_file_text`'s parse_copy BOM-strip above so the
+	# scanner sees the same view of the file the parser does; the BOM
+	# itself stays in `text` so the byte-survival F5 contract still holds
+	# (codex round 3, F-3-6 — without it, files saved with a Windows BOM
+	# left the entry in place after Remove).
 	while cursor < text.length() and _is_json_ws(text[cursor]):
+		cursor += 1
+	if cursor < text.length() and text[cursor] == "﻿":
 		cursor += 1
 	if cursor < text.length() and (text[cursor] == "{" or text[cursor] == "["):
 		cursor += 1
 	var container_depth := 0
 	for key in key_path:
 		var key_bytes := JSON.stringify(String(key))
-		var match := _find_key_at_container_depth(text, cursor, key_bytes, container_depth)
+		var match := _find_key_at_container_depth(text, cursor, key_bytes)
 		if match.is_empty():
 			return text
 		var open_char := text[match["value_start"]]
@@ -765,40 +821,47 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 			return text  # leaf isn't an object/array — path can't reach our entry
 		container_depth += 1
 		cursor = match["value_start"] + 1
-	# Now find `"<server_name>":` at `container_depth` inside the container.
+	# Now find `"<server_name>":` at the top level of the container we descended
+	# into (the helper gates on `inner_depth == 0`).
 	var entry_bytes := JSON.stringify(server_name)
-	var entry_match := _find_key_at_container_depth(text, cursor, entry_bytes, container_depth)
+	var entry_match := _find_key_at_container_depth(text, cursor, entry_bytes)
 	if entry_match.is_empty():
 		return text
 	var key_start: int = entry_match["key_start"]
 	var value_end: int = entry_match["value_end"]
-	# Trim leading whitespace + an optional preceding comma from the removed
-	# span. The trailing-comma trim is the part that's load-bearing when our
-	# entry is NOT the last in the container; the leading-comma trim is the
-	# load-bearing counterpart when our entry IS the last (so we don't leave a
-	# trailing `,` followed by the container's closing `}`).
-	var remove_start := key_start
-	while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
-		remove_start -= 1
-	if remove_start > 0 and text[remove_start - 1] == ",":
-		remove_start -= 1
-		while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
-			remove_start -= 1
+	# Trim the surrounding comma in a mutually exclusive way: the trailing comma
+	# (after the entry's value) carries the burden when the entry is NOT the last
+	# in its container, and the leading comma (before the entry's key) carries it
+	# only when the entry IS the last. Trimming BOTH unconditionally corrupts a
+	# middle-position entry into `"x"}"y"` with no separator — codex-review
+	# finding F5 (regression after the initial round).
 	var remove_end := value_end
-	if remove_end < text.length() and text[remove_end] == ",":
+	var had_trailing_comma := remove_end < text.length() and text[remove_end] == ","
+	if had_trailing_comma:
 		remove_end += 1
 	while remove_end < text.length() and _is_json_ws(text[remove_end]):
 		remove_end += 1
+	var remove_start := key_start
+	if not had_trailing_comma:
+		while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
+			remove_start -= 1
+		if remove_start > 0 and text[remove_start - 1] == ",":
+			remove_start -= 1
+			while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
+				remove_start -= 1
 	return text.substr(0, remove_start) + text.substr(remove_end)
 
 
 ## Look for `key_bytes` (a JSON-encoded string literal including the surrounding
-## quotes) at exactly `container_depth` inside `text`, starting the scan at
-## `start`. `container_depth` is the depth of the *container* we're inside —
-## 0 means "directly inside the root object/array", 1 means "inside the first
-## nested object/array", etc. Returns `{key_start, value_start, value_end}` on
-## success or `{}` if the key isn't present at that depth.
-static func _find_key_at_container_depth(text: String, start: int, key_bytes: String, container_depth: int) -> Dictionary:
+## quotes) at the TOP LEVEL of the container we're inside, scanning `text` from
+## `start` onwards. The caller is expected to advance `start` just past the
+## container's opening `{` or `[`, so we begin with `inner_depth == 0` and a
+## key matches when we hit it while `inner_depth` is still 0. The scan exits
+## immediately if `inner_depth` drops below 0 (the target container closed)
+## to prevent same-named keys in later sibling containers from being picked
+## up. Returns `{key_start, value_start, value_end}` on success or `{}` if
+## the key isn't present in that container.
+static func _find_key_at_container_depth(text: String, start: int, key_bytes: String) -> Dictionary:
 	var i := start
 	var in_string := false
 	var escape := false
@@ -833,6 +896,14 @@ static func _find_key_at_container_depth(text: String, start: int, key_bytes: St
 			inner_depth += 1
 		elif c == "}" or c == "]":
 			inner_depth -= 1
+			# Bail out the moment we leave the container we're scanning. Without
+			# this guard, a later sibling container at the same level (e.g. a
+			# top-level `extensions` block after `mcpServers` closes) re-balances
+			# `inner_depth` back to 0 and a same-named key in that sibling would
+			# match — silently deleting data we never intended to touch
+			# (codex-review finding F5, regression after the initial round).
+			if inner_depth < 0:
+				return {}
 		i += 1
 	return {}
 

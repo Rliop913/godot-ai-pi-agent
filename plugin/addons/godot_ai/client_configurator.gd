@@ -1003,6 +1003,35 @@ static func effective_config_path(id: String, launch_context: Dictionary = {}) -
 	return fallback
 
 
+## Path that `_check_status_merged` would consider authoritative for the
+## server entry, or `path_template` when no entry is found anywhere.
+## For Pi-style merge clients this is the latest project tier when one
+## exists (matching the F2 last-wins status logic), falling back to the
+## latest global tier, then to `path_template`.
+##
+## The dock uses this for Open/Reveal so the file the user inspects is
+## the same file that drives the status check — `effective_config_path`
+## fails closed (returns `path_template`) when there are multiple project
+## tiers, which historically sent users to the wrong file (codex round 3,
+## F-3-4). Splitting this from `effective_config_path` keeps the manual
+## instructions fail-closed while letting the dock follow the
+## authoritative tier.
+static func effective_authoritative_path(id: String, launch_context: Dictionary = {}) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null:
+		return ""
+	var resolution := client.resolved_config_path_details()
+	var fallback := str(resolution.get("path", ""))
+	var context := launch_context
+	if context.is_empty() and client.command_shape != Client.CommandShape.NONE:
+		context = capture_launch_context()
+	var roots := _project_roots_from_context(context)
+	var authoritative: String = JsonStrategy.authoritative_tier_path(client, SERVER_NAME, roots)
+	if not authoritative.is_empty():
+		return authoritative
+	return fallback
+
+
 static func is_installed(id: String) -> bool:
 	var client := ClientRegistry.get_by_id(id)
 	return client != null and client.is_installed()
